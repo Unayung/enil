@@ -77,6 +77,11 @@ pub fn download(message_id: &str) -> Result<Value, String> {
     request(json!({ "cmd": "download", "messageId": message_id, "preview": false }))
 }
 
+/// 送檔案或圖片。daemon 依副檔名決定當圖片、影片還是一般檔案送。
+pub fn send_file(chat: &str, path: &str) -> Result<Value, String> {
+    request(json!({ "cmd": "sendFile", "chat": chat, "path": path }))
+}
+
 pub fn send(chat: &str, text: &str) -> Result<Value, String> {
     request(json!({ "cmd": "send", "chat": chat, "text": text }))
 }

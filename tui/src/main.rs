@@ -11,7 +11,8 @@ mod client;
 mod model;
 
 use crossterm::event::{
-    self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event,
+    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event,
     KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
@@ -28,6 +29,7 @@ use ratatui_image::{Resize, StatefulImage};
 use std::collections::HashMap;
 use serde_json::Value;
 use std::io::{stdout, IsTerminal, Write};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
@@ -59,6 +61,20 @@ struct Search {
     pick: usize,
 }
 
+#[derive(Default)]
+struct PathPrompt {
+    text: String,
+    /// 目前這個前綴補得出來的候選。只在內容變動時重算（要讀目錄）。
+    matches: Vec<String>,
+}
+
+impl PathPrompt {
+    fn set(&mut self, text: String) {
+        self.matches = complete_path(&text).1;
+        self.text = text;
+    }
+}
+
 struct App {
     chats: Vec<Chat>,
     selected: usize,
@@ -83,6 +99,10 @@ struct App {
     all_chats: Vec<Chat>,
     /// 按鍵說明開著。
     help: bool,
+    /// 掛著等送出的附件（本機路徑）。Enter 送出，Esc 或在空的輸入框按 Backspace 取消。
+    attach: Option<String>,
+    /// Ctrl-F 的路徑輸入框。None 是沒開。
+    path_prompt: Option<PathPrompt>,
     /// Ctrl-B 切換：清單收窄成只有聊天室名稱（一行一筆，沒有預覽與時間）。
     compact: bool,
     theme: Theme,
@@ -146,6 +166,8 @@ impl App {
         self.open = Some(mid.clone());
         self.msgs.clear();
         self.cursor = None;
+        // 附件是掛給「剛才那個聊天室」的。帶到下一個聊天室，一個 Enter 就送錯人。
+        self.attach = None;
         self.scroll = 0;
         self.busy = true;
         self.status = format!("載入 {name}…");
@@ -261,15 +283,78 @@ impl App {
     fn send_input(&mut self) {
         let text = self.input.trim().to_string();
         let Some(mid) = self.open.clone() else { return };
-        if text.is_empty() {
+        let attach = self.attach.take();
+        if text.is_empty() && attach.is_none() {
             return;
         }
         self.input.clear();
         self.status = "傳送中…".into();
-        self.spawn(move || match client::send(&mid, &text) {
-            Ok(_) => Update::Sent,
-            Err(e) => Update::Error(e),
+        // 附件與文字分開送，附件先：LINE 沒有「圖片加說明」這種單一訊息。
+        self.spawn(move || {
+            let sent = attach
+                .map_or(Ok(()), |path| client::send_file(&mid, &path).map(|_| ()))
+                .and_then(|()| if text.is_empty() { Ok(()) } else { client::send(&mid, &text).map(|_| ()) });
+            match sent {
+                Ok(()) => Update::Sent,
+                Err(e) => Update::Error(e),
+            }
         });
+    }
+
+    /// 把一個檔案掛成附件。給的可以是路徑、~ 開頭的路徑、或 file:// 網址。
+    fn attach_file(&mut self, raw: &str) -> bool {
+        let path = local_path(raw);
+        if Path::new(&path).is_file() {
+            self.status = "已附加，Enter 送出".into();
+            self.attach = Some(path);
+            true
+        } else {
+            self.status = format!("找不到檔案：{}", fit(raw.trim(), 50));
+            false
+        }
+    }
+
+    /// Ctrl-V：依序看剪貼簿裡有沒有「複製的檔案」、圖片、文字。
+    fn paste(&mut self) {
+        match clipboard() {
+            Clip::File(path) => {
+                self.attach_file(&path);
+            }
+            Clip::Image(path) => {
+                self.status = "已附加剪貼簿的圖片，Enter 送出".into();
+                self.attach = Some(path);
+            }
+            Clip::Text(text) => self.paste_text(&text),
+            Clip::Empty => self.status = "剪貼簿是空的（或讀不到，需要 wl-paste）".into(),
+        }
+    }
+
+    /// 貼上文字。如果整段就是一個存在的檔案路徑（把檔案拖進終端機就是貼路徑），當成附件。
+    fn paste_text(&mut self, text: &str) {
+        let one_line = !text.trim().contains('\n');
+        if one_line && Path::new(&local_path(text)).is_file() {
+            self.attach_file(text);
+        } else {
+            self.input.push_str(text.trim_end_matches('\n'));
+        }
+    }
+
+    /// 終端機的貼上（bracketed paste）。浮層開著時貼進浮層的輸入框。
+    fn on_paste(&mut self, text: String) {
+        // 終端機貼上時常把換行送成 \r（跟按 Enter 同一個字元）。轉回來，不然送出去的
+        // 訊息裡是 \r，在 LINE 上不會換行。
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        let first_line = text.lines().next().unwrap_or("").to_string();
+        if let Some(prompt) = self.path_prompt.as_mut() {
+            let joined = format!("{}{}", prompt.text, first_line.trim());
+            prompt.set(joined);
+        } else if let Some(search) = self.search.as_mut() {
+            search.query.push_str(&first_line);
+            search.pick = 0;
+        } else if self.open.is_some() {
+            // 剪貼簿只有圖片時，終端機貼出來的是空的 —— 那就自己去剪貼簿拿。
+            if text.trim().is_empty() { self.paste() } else { self.paste_text(&text) }
+        }
     }
 
     fn apply(&mut self, u: Update) {
@@ -364,6 +449,122 @@ impl App {
 }
 
 /// 依字元數截斷（不是 byte）—— 中文一個字算一個，切在 byte 邊界會 panic。
+/// 剪貼簿裡的東西。
+enum Clip {
+    /// 在檔案管理員裡複製的檔案（text/uri-list 的第一個）。
+    File(String),
+    /// 圖片內容，已經存成檔案。
+    Image(String),
+    Text(String),
+    Empty,
+}
+
+/// 讀剪貼簿。終端機的貼上只會送文字，圖片與「複製的檔案」要自己問。
+/// ponytail: 只支援 Wayland（wl-paste）。X11 要 xclip、macOS 要 pngpaste，用到再加；
+/// 複製了多個檔案時只取第一個。
+fn clipboard() -> Clip {
+    let run = |args: &[&str]| {
+        Command::new("wl-paste").args(args).stderr(Stdio::null()).output().ok().map(|o| o.stdout)
+    };
+    let types = String::from_utf8_lossy(&run(&["--list-types"]).unwrap_or_default()).into_owned();
+    let has = |mime: &str| types.lines().any(|t| t == mime);
+
+    if has("text/uri-list") {
+        let list = String::from_utf8_lossy(&run(&["--type", "text/uri-list"]).unwrap_or_default()).into_owned();
+        if let Some(uri) = list.lines().find(|l| l.starts_with("file://")) {
+            return Clip::File(uri.trim().to_string());
+        }
+    }
+    for (mime, ext) in [("image/png", "png"), ("image/jpeg", "jpg"), ("image/webp", "webp"), ("image/gif", "gif")] {
+        if !has(mime) {
+            continue;
+        }
+        let bytes = run(&["--type", mime]).unwrap_or_default();
+        let dir = client::state_dir().join("media");
+        let path = dir.join(format!("paste-{}.{ext}", now_ms()));
+        if !bytes.is_empty() && std::fs::create_dir_all(&dir).is_ok() && std::fs::write(&path, bytes).is_ok() {
+            // 跟 daemon 的媒體快取一樣只給自己讀。
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
+            return Clip::Image(path.to_string_lossy().into_owned());
+        }
+    }
+    match run(&["--no-newline", "--type", "text"]) {
+        Some(bytes) if !bytes.is_empty() => Clip::Text(String::from_utf8_lossy(&bytes).into_owned()),
+        _ => Clip::Empty,
+    }
+}
+
+/// 把使用者給的東西變成本機路徑：去掉 file://（並解開 %XX，中文檔名在 URI 裡都是編碼過的）、
+/// 展開開頭的 ~。
+fn local_path(raw: &str) -> String {
+    let raw = raw.trim();
+    let path = match raw.strip_prefix("file://") {
+        Some(rest) => percent_decode(rest),
+        None => raw.to_string(),
+    };
+    match path.strip_prefix("~/") {
+        Some(rest) => format!("{}/{rest}", std::env::var("HOME").unwrap_or_default()),
+        None => path,
+    }
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = bytes.get(i + 1..i + 3).and_then(|h| std::str::from_utf8(h).ok());
+        match (bytes[i], hex.and_then(|h| u8::from_str_radix(h, 16).ok())) {
+            (b'%', Some(byte)) => {
+                out.push(byte);
+                i += 3;
+            }
+            (b, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 路徑補完：回傳（補到共同前綴之後的輸入, 候選清單）。目錄的候選帶結尾的 /。
+/// 輸入裡的 ~ 原樣保留，只在查目錄時展開。
+fn complete_path(input: &str) -> (String, Vec<String>) {
+    let split = input.rfind('/').map_or(0, |i| i + 1);
+    let (base, prefix) = input.split_at(split);
+    let dir = if base.is_empty() { ".".to_string() } else { local_path(base) };
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            // 隱藏檔要自己打出那個點才列。
+            let wanted = name.starts_with(prefix) && (prefix.starts_with('.') || !name.starts_with('.'));
+            wanted.then(|| if e.path().is_dir() { name + "/" } else { name })
+        })
+        .collect();
+    names.sort();
+    let common = names.iter().skip(1).fold(names.first().cloned().unwrap_or_default(), |acc, n| {
+        acc.chars().zip(n.chars()).take_while(|(a, b)| a == b).map(|(a, _)| a).collect()
+    });
+    let completed = if common.len() > prefix.len() { format!("{base}{common}") } else { input.to_string() };
+    (completed, names)
+}
+
+fn human_size(bytes: u64) -> String {
+    match bytes {
+        b if b < 1024 => format!("{b} B"),
+        b if b < 1024 * 1024 => format!("{} KB", b.div_ceil(1024)),
+        b => format!("{:.1} MB", b as f64 / 1048576.0),
+    }
+}
+
 /// 把檔案或網址交給系統的預設程式，回傳要顯示在狀態列的字。
 /// 輸出全部丟掉：xdg-open 往終端機寫任何東西都會把畫面弄花。
 fn system_open(target: &str) -> String {
@@ -939,11 +1140,20 @@ fn draw(f: &mut Frame, app: &mut App) {
     let input_block = pane(Line::default(), in_chat, accent);
     let input_inner = input_block.inner(right[1]);
     f.render_widget(input_block, right[1]);
-    let room = input_inner.width.saturating_sub(3) as usize; // 「› 」與游標那一格
+    // 掛著的附件：輸入框最前面一個標籤，檔名與大小。
+    let chip = app.attach.as_ref().map(|path| {
+        let name = Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        format!(" {} · {} ", fit(&name, 28), human_size(size))
+    });
+    let chip_w = chip.as_ref().map_or(0, |c| c.width() + 1);
+    let room = (input_inner.width.saturating_sub(3) as usize).saturating_sub(chip_w); // 「› 」與游標那一格
     // 打超過寬度時顯示尾巴：正在打的那幾個字要看得到。
     let mut shown = String::new();
     let mut used = 0;
     for c in app.input.chars().rev() {
+        // 貼進來的多行文字：輸入框只有一行，換行用符號表示，送出時還是真的換行。
+        let c = if c == '\n' { '⏎' } else { c };
         let w = c.width().unwrap_or(0);
         if used + w > room {
             break;
@@ -953,6 +1163,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     }
     let body = match (in_chat, app.input.is_empty()) {
         (false, _) => Span::styled("先選一個聊天室", dim()),
+        (true, true) if chip.is_some() => Span::styled("Enter 送出　Esc 取消附件", dim()),
         (true, true) => Span::styled(
             format!("傳訊息給 {}…", fit(title.as_deref().unwrap_or(""), room.saturating_sub(12))),
             dim(),
@@ -960,20 +1171,28 @@ fn draw(f: &mut Frame, app: &mut App) {
         (true, false) => Span::raw(shown),
     };
     let prompt = Span::styled("› ", if in_chat { Style::new().fg(accent) } else { dim() });
-    f.render_widget(Paragraph::new(Line::from(vec![prompt, body])), input_inner);
+    let mut input_line = vec![prompt];
+    if let Some(chip) = chip {
+        input_line.push(Span::styled(chip, Style::new().fg(on_accent).bg(accent)));
+        input_line.push(Span::raw(" "));
+    }
+    input_line.push(body);
+    f.render_widget(Paragraph::new(Line::from(input_line)), input_inner);
     // 游標放在輸入位置：輸入法（fcitx5）的候選字視窗是跟著游標走的。
     if in_chat && input_inner.width > 2 {
-        f.set_cursor_position((input_inner.x + 2 + used as u16, input_inner.y));
+        f.set_cursor_position((input_inner.x + 2 + (chip_w + used) as u16, input_inner.y));
     }
 
     // ---------------------------------------------------------------- 狀態列
     // 左：模式標籤＋目前聊天室＋按鍵提示（或狀態訊息）。右：跟 daemon 的連線。
-    let (mode, hints) = if app.search.is_some() {
+    let (mode, hints) = if app.path_prompt.is_some() {
+        ("附檔", keys(&[("Tab", "補完"), ("Enter", "附加"), ("Esc", "取消")]))
+    } else if app.search.is_some() {
         ("搜尋", keys(&[("↑↓", "選擇"), ("Enter", "開啟"), ("Esc", "取消")]))
     } else if app.cursor.is_some() {
         ("選取", keys(&[("Enter", "開啟"), ("Tab", "上一個"), ("⇧Tab", "下一個"), ("Esc", "取消")]))
     } else if in_chat {
-        ("對話", keys(&[("Enter", "送出"), ("Tab", "選附件 ↗"), ("/", "搜尋"), ("^B", "側欄"), ("F1", "按鍵"), ("Esc", "返回")]))
+        ("對話", keys(&[("Enter", "送出"), ("^V", "貼上"), ("^F", "附檔"), ("Tab", "選附件 ↗"), ("/", "搜尋"), ("F1", "按鍵"), ("Esc", "返回")]))
     } else {
         ("清單", keys(&[("↑↓", "選擇"), ("Enter", "開啟"), ("/", "搜尋"), ("?", "按鍵"), ("q", "離開")]))
     };
@@ -1074,6 +1293,37 @@ fn draw_overlays(f: &mut Frame, app: &App) {
         }
     }
 
+    if let Some(prompt) = &app.path_prompt {
+        let area = centered(f.area(), 72, 14);
+        f.render_widget(Clear, area);
+        let block = pane(Line::from(Span::styled(" 附加檔案 ", bold)), true, accent)
+            .title_bottom(Line::from(" Tab 補完   Enter 附加   Esc 取消 ").right_aligned());
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        if inner.height >= 1 && inner.width > 4 {
+            // 路徑太長時顯示尾巴。
+            let room = inner.width as usize - 3;
+            let mut shown = String::new();
+            let mut used = 0;
+            for c in prompt.text.chars().rev() {
+                let w = c.width().unwrap_or(0);
+                if used + w > room {
+                    break;
+                }
+                shown.insert(0, c);
+                used += w;
+            }
+            let mut lines = vec![Line::from(vec![Span::styled("› ", Style::new().fg(accent)), Span::raw(shown)])];
+            lines.extend(
+                prompt.matches.iter().take(inner.height as usize - 1).map(|m| {
+                    Line::from(Span::styled(format!("  {}", fit(m, room)), dim()))
+                }),
+            );
+            f.render_widget(Paragraph::new(lines), inner);
+            f.set_cursor_position((inner.x + 2 + used as u16, inner.y));
+        }
+    }
+
     if app.help {
         const HELP: &[(&str, &str)] = &[
             ("清單", ""),
@@ -1090,6 +1340,9 @@ fn draw_overlays(f: &mut Frame, app: &App) {
             ("/", "搜尋全部聊天室（輸入框空的時候）"),
             ("Esc", "取消選取；再按一次回清單"),
             ("任何時候", ""),
+            ("Ctrl-V", "貼上：圖片或複製的檔案變附件，文字進輸入框"),
+            ("Ctrl-F", "附加檔案（輸入路徑，Tab 補完）"),
+            ("拖檔案進來", "附加那個檔案"),
             ("Ctrl-B", "清單收窄成只有名稱／展開"),
             ("F1", "這個說明（清單模式也可以按 ?）"),
             ("Ctrl-C", "離開"),
@@ -1128,7 +1381,13 @@ fn draw_overlays(f: &mut Frame, app: &App) {
 fn restore_terminal() -> std::io::Result<()> {
     set_pointer("text"); // 還給終端機平常的 I-beam
     disable_raw_mode()?;
-    execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture, DisableFocusChange)
+    execute!(
+        stdout(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableFocusChange,
+        DisableBracketedPaste
+    )
 }
 
 /// daemon 的 state 裡，登入完成後自己的 mid。還沒登入就是 None。
@@ -1262,7 +1521,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     enable_raw_mode()?;
-    execute!(stdout(), EnterAlternateScreen, EnableMouseCapture, EnableFocusChange)?;
+    // BracketedPaste：貼上的整段文字變成一個事件。沒開的話貼多行會被當成一個個按鍵，
+    // 每個換行都是一次「送出」。
+    execute!(
+        stdout(),
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableFocusChange,
+        EnableBracketedPaste
+    )?;
     let mut term = Terminal::new(CrosstermBackend::new(stdout()))?;
 
     // 還沒登入就先過登入畫面。使用者在那裡離開的話，程式也就結束。
@@ -1295,6 +1562,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         search: None,
         all_chats: vec![],
         help: false,
+        attach: None,
+        path_prompt: None,
         theme: Theme::load(),
         tx,
         list_area: Rect::default(),
@@ -1378,8 +1647,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Event::FocusLost => app.focused = false,
             _ => {}
         }
+        if let Event::Paste(text) = ev {
+            app.on_paste(text);
+            continue;
+        }
         // 浮層開著時滑鼠不作用，免得點穿到底下的清單。
-        if matches!(ev, Event::Mouse(_)) && (app.help || app.search.is_some()) {
+        if matches!(ev, Event::Mouse(_)) && (app.help || app.search.is_some() || app.path_prompt.is_some()) {
             continue;
         }
         if let Event::Mouse(m) = ev {
@@ -1500,10 +1773,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             continue;
         }
+        // 路徑輸入框開著時，按鍵全部歸它。
+        if let Some(prompt) = app.path_prompt.as_mut() {
+            match key.code {
+                KeyCode::Esc => app.path_prompt = None,
+                KeyCode::Tab => {
+                    let completed = complete_path(&prompt.text).0;
+                    prompt.set(completed);
+                }
+                KeyCode::Backspace => {
+                    let mut text = prompt.text.clone();
+                    text.pop();
+                    prompt.set(text);
+                }
+                KeyCode::Char(c) => {
+                    let text = format!("{}{c}", prompt.text);
+                    prompt.set(text);
+                }
+                KeyCode::Enter => {
+                    let text = prompt.text.clone();
+                    // 是檔案才關掉；打錯了留著讓人改，錯誤顯示在狀態列。
+                    if app.attach_file(&text) {
+                        app.path_prompt = None;
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && app.open.is_some() {
+            match key.code {
+                KeyCode::Char('v') => {
+                    app.paste();
+                    continue;
+                }
+                KeyCode::Char('f') => {
+                    let mut prompt = PathPrompt::default();
+                    prompt.set("~/".into());
+                    app.path_prompt = Some(prompt);
+                    continue;
+                }
+                _ => {}
+            }
+        }
         match key.code {
             // 輸入框有字時 Enter 永遠是送出，不管有沒有選中訊息 —— 打到一半的字不能被吃掉。
             KeyCode::Enter => {
-                if app.open.is_some() && !app.input.is_empty() {
+                if app.open.is_some() && (!app.input.is_empty() || app.attach.is_some()) {
                     app.send_input();
                 } else if let Some(i) = app.cursor {
                     app.open_msg(i);
@@ -1513,6 +1829,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             KeyCode::Tab if app.open.is_some() => app.move_cursor(true),
             KeyCode::BackTab if app.open.is_some() => app.move_cursor(false),
+            // 輸入框已經空了再按一次，才拿掉附件。
+            KeyCode::Backspace if app.input.is_empty() => app.attach = None,
             KeyCode::Backspace => {
                 app.input.pop();
             }
@@ -1529,8 +1847,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             KeyCode::PageDown => app.scroll = app.scroll.saturating_sub(10),
             // 先取消選取，再按一次才回清單。
             KeyCode::Esc if app.cursor.is_some() => app.cursor = None,
+            KeyCode::Esc if app.attach.is_some() => {
+                app.attach = None;
+                app.status.clear();
+            }
             KeyCode::Esc => {
                 app.open = None;
+                app.attach = None;
                 app.msgs.clear();
             }
             KeyCode::Char(c) => {
@@ -1589,6 +1912,42 @@ mod tests {
         assert_eq!(spans, ["看這個", "https://a.example/x", " 很棒"]);
         assert!(text.lines[0].spans[1].style.add_modifier.contains(Modifier::UNDERLINED));
         assert_eq!(text.lines.len(), 2);
+    }
+
+    #[test]
+    fn paths_from_clipboard_and_drag() {
+        // 檔案管理員給的是編碼過的 URI，中文檔名要解得回來。
+        assert_eq!(local_path("file:///tmp/%E5%A0%B1%E5%83%B9%20v2.pdf\n"), "/tmp/報價 v2.pdf");
+        // 不是 URI 的路徑原樣保留：檔名裡真的有 % 的不能被解掉。
+        assert_eq!(local_path("/tmp/100%25.txt"), "/tmp/100%25.txt");
+        assert_eq!(percent_decode("a%zzb%4"), "a%zzb%4"); // 壞掉的編碼不動
+        let home = std::env::var("HOME").unwrap_or_default();
+        assert_eq!(local_path("~/a.png"), format!("{home}/a.png"));
+        assert_eq!(human_size(900), "900 B");
+        assert_eq!(human_size(347_566), "340 KB");
+        assert_eq!(human_size(3 * 1024 * 1024), "3.0 MB");
+    }
+
+    #[test]
+    fn path_completion() {
+        let dir = std::env::temp_dir().join(format!("enil-tui-test-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("reports")).unwrap();
+        for f in ["report-jan.pdf", "report-feb.pdf", "notes.txt", ".hidden"] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        let base = format!("{}/", dir.display());
+        // 多個候選：補到共同前綴，目錄帶 /。
+        let (text, names) = complete_path(&format!("{base}rep"));
+        assert_eq!(text, format!("{base}report"));
+        assert_eq!(names, ["report-feb.pdf", "report-jan.pdf", "reports/"]);
+        // 唯一候選：補完整個名字。
+        assert_eq!(complete_path(&format!("{base}no")).0, format!("{base}notes.txt"));
+        // 隱藏檔要自己打出那個點才列。
+        assert!(!complete_path(&base).1.contains(&".hidden".to_string()));
+        assert_eq!(complete_path(&format!("{base}.")).1, [".hidden"]);
+        // 沒有符合的：輸入不動。
+        assert_eq!(complete_path(&format!("{base}zzz")).0, format!("{base}zzz"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
