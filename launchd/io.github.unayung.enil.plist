@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  enil daemon（macOS）。systemd 的 enil.service 在 mac 上的對應物。
+
+  安裝（在 repo 根目錄）：
+    mkdir -p ~/Library/LaunchAgents
+    sed "s|@REPO@|$PWD|g; s|@HOME@|$HOME|g" launchd/io.github.unayung.enil.plist \
+      > ~/Library/LaunchAgents/io.github.unayung.enil.plist
+    launchctl load -w ~/Library/LaunchAgents/io.github.unayung.enil.plist
+
+  第一次登入要掃 QR：daemon 會把 QR 寫進 state.json，或看 log 裡的網址。
+  沒有 journald，所以 stdout/stderr 都導到檔案。
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.github.unayung.enil</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>exec npx tsx daemon.ts</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>@REPO@</string>
+
+  <!-- launchd 給的 PATH 極簡，brew 裝的 node 不在裡面 -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <!-- systemd Restart=on-failure 的對應：掛了就重起 -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+
+  <key>StandardOutPath</key>
+  <string>@HOME@/Library/Logs/enil.log</string>
+  <key>StandardErrorPath</key>
+  <string>@HOME@/Library/Logs/enil.log</string>
+</dict>
+</plist>

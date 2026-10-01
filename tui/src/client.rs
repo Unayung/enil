@@ -1,0 +1,82 @@
+//! 跟 enil daemon 講話。協定是 unix socket 上一行一個 JSON。
+//!
+//! 這裡完全不碰 LINE —— 登入、E2EE、輪詢都在 daemon 那側。
+//! 每個請求開一條新連線：daemon 支援並行連線，這樣就不必自己管
+//! 單一連線上的請求／回應配對。
+
+use serde_json::{json, Value};
+use std::env;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+
+pub fn state_dir() -> PathBuf {
+    let base = env::var("XDG_STATE_HOME").unwrap_or_else(|_| {
+        format!("{}/.local/state", env::var("HOME").unwrap_or_default())
+    });
+    PathBuf::from(base).join("enil")
+}
+
+pub fn request(req: Value) -> Result<Value, String> {
+    let mut stream = UnixStream::connect(state_dir().join("sock"))
+        .map_err(|_| "daemon 沒在跑（systemctl --user start enil）".to_string())?;
+    let mut line = req.to_string();
+    line.push('\n');
+    stream.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+
+    let mut reader = BufReader::new(stream);
+    let mut buf = String::new();
+    reader.read_line(&mut buf).map_err(|e| e.to_string())?;
+    let res: Value = serde_json::from_str(&buf).map_err(|e| e.to_string())?;
+    if res.get("ok").and_then(Value::as_bool) == Some(true) {
+        Ok(res.get("data").cloned().unwrap_or(Value::Null))
+    } else {
+        Err(res
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("未知錯誤")
+            .to_string())
+    }
+}
+
+/// 訂閱 daemon 的推送：一條常駐連線，每則新訊息一行。會一直擋到斷線才回來，
+/// 重連由呼叫端決定。舊版 daemon 不認得 subscribe，只會回一行錯誤然後沒下文 ——
+/// 那行沒有 event 欄位，被濾掉，行為退回純輪詢。
+pub fn subscribe(on_open: impl FnOnce(), mut on_message: impl FnMut(Value)) -> Result<(), String> {
+    let mut stream = UnixStream::connect(state_dir().join("sock")).map_err(|e| e.to_string())?;
+    stream
+        .write_all(b"{\"cmd\":\"subscribe\"}\n")
+        .map_err(|e| e.to_string())?;
+    on_open();
+    for line in BufReader::new(stream).lines() {
+        let line = line.map_err(|e| e.to_string())?;
+        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+        if v.get("event").and_then(Value::as_str) == Some("message") {
+            on_message(v.get("data").cloned().unwrap_or(Value::Null));
+        }
+    }
+    Ok(())
+}
+
+pub fn chats(limit: u32) -> Result<Value, String> {
+    request(json!({ "cmd": "chats", "limit": limit }))
+}
+
+pub fn history(chat: &str, count: u32, before: Option<&str>) -> Result<Value, String> {
+    let mut req = json!({ "cmd": "history", "chat": chat, "count": count });
+    match before {
+        // 往前翻頁時不動已讀；第一次進入才標記。
+        Some(id) => req["before"] = json!(id),
+        None => req["markRead"] = json!(true),
+    }
+    request(req)
+}
+
+/// 下載原檔（不是縮圖），回傳 { path }。
+pub fn download(message_id: &str) -> Result<Value, String> {
+    request(json!({ "cmd": "download", "messageId": message_id, "preview": false }))
+}
+
+pub fn send(chat: &str, text: &str) -> Result<Value, String> {
+    request(json!({ "cmd": "send", "chat": chat, "text": text }))
+}

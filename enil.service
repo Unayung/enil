@@ -1,0 +1,35 @@
+# LINE daemon（user service）
+#
+# 這個檔案裡的 @REPO@ 是佔位符，安裝時用實際路徑換掉 —— repo 放哪都行，
+# 不必是 ~/Projects/enil。在 repo 根目錄跑：
+#
+#   mkdir -p ~/.config/systemd/user
+#   sed "s|@REPO@|$PWD|" enil.service > ~/.config/systemd/user/enil.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now enil
+#
+# 直接 cp 會留下字面上的 @REPO@，systemd 起不來並回報找不到工作目錄。
+#
+# 第一次登入不需要終端機：daemon 會把 QR 寫進 state，用 bar 上的 LINE 外掛掃。
+# headless 想要 QR 圖片的話要先裝 qrencode；沒裝就只會拿到登入網址。
+[Unit]
+Description=LINE daemon (enil)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 只是為了找得到 daemon.ts 與 node_modules —— 憑證與狀態都在
+# $XDG_STATE_HOME/enil（見 paths.ts），跟從哪裡啟動無關。
+WorkingDirectory=@REPO@
+# node 由 nvm 管理，路徑含版本號（~/.config/nvm/versions/node/vX/bin），
+# 寫死會在升級 node 之後壞掉。用 login shell 讓 nvm 自己解析出當下的版本。
+ExecStart=/bin/bash -lc 'exec npx tsx daemon.ts'
+Restart=on-failure
+RestartSec=5
+# QR 網址與 storage.json 都是憑證，不要外洩到 journal 以外的地方
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

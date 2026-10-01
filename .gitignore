@@ -1,0 +1,13 @@
+node_modules/
+
+# 憑證與私人內容 —— 絕對不能進版控
+storage.json
+storage.json.*
+failed-e2ee.jsonl
+login-response.json
+storage-probe.json
+
+# 執行期產物
+*.log
+style.md
+tui/target/

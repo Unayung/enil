@@ -1,0 +1,19 @@
+[package]
+name = "enil-tui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ratatui = "0.30"
+crossterm = "0.29"
+serde_json = "1"
+# 關掉預設的 chafa-dyn：那需要系統的 chafa 函式庫，而我們要的
+# kitty / sixel / iterm2 偵測不需要它。
+ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"] }
+image = "0.25.10"
+# 寬字元（中日韓）佔兩格，排版要算顯示寬度不是字數。ratatui 本來就依賴它。
+unicode-width = "0.2"
+
+[[bin]]
+name = "enil-tui"
+path = "src/main.rs"

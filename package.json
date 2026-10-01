@@ -1,0 +1,16 @@
+{
+  "name": "enil",
+  "type": "module",
+  "scripts": {
+    "daemon": "tsx daemon.ts",
+    "line": "tsx cli.ts"
+  },
+  "dependencies": {
+    "@evex/linejs": "npm:@jsr/evex__linejs@^3.3.3",
+    "qrcode-terminal": "^0.12.0",
+    "tweetnacl": "^1.0.3"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0"
+  }
+}
