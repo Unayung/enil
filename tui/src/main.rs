@@ -154,6 +154,10 @@ struct App {
     all_chats: Vec<Chat>,
     /// 按鍵說明開著。
     help: bool,
+    /// 說明捲到第幾列。小螢幕（14 吋筆電）放不下整份說明時用。
+    help_scroll: u16,
+    /// 上次畫說明時最多能捲幾列。畫的時候才知道（看終端機多高），按鍵處理拿它來夾限。
+    help_max: std::cell::Cell<u16>,
     /// 掛著等送出的附件（本機路徑）。Enter 送出，Esc 或在空的輸入框按 Backspace 取消。
     attach: Option<String>,
     /// Ctrl-F 的路徑輸入框。None 是沒開。
@@ -2048,7 +2052,7 @@ fn draw_overlays(f: &mut Frame, app: &App) {
             ]),
             ("任何時候", &[
                 ("Ctrl-B", "清單：展開 → 只有名稱 → 隱藏"),
-                ("? 或 F1", "這個說明（聊天時 ? 是字，用 F1）"),
+                ("? 或 F1", "這個說明（聊天時 ? 是字，用 F1）；j/k 捲動"),
                 ("Ctrl-C", "離開"),
             ]),
             ("滑鼠", &[
@@ -2085,17 +2089,25 @@ fn draw_overlays(f: &mut Frame, app: &App) {
             }
             cols[last].extend(group_lines(g));
         }
-        let height = cols.iter().map(Vec::len).max().unwrap_or(0) as u16 + 2;
-        let area = centered(screen, COL_W * cols.len() as u16 + 2, height);
-        f.render_widget(Clear, area);
-        let block = pane(Line::from(Span::styled(" 按鍵 ", bold)), true, accent)
-            .title_bottom(Line::from(" 按任意鍵關閉 ").right_aligned());
+        let total = cols.iter().map(Vec::len).max().unwrap_or(0) as u16;
+        let area = centered(screen, COL_W * cols.len() as u16 + 2, total + 2);
+        // 還是放不下就捲動（兩欄一起捲）。能捲多少要畫的時候才知道，記給按鍵處理用。
+        let max = total.saturating_sub(area.height.saturating_sub(2));
+        app.help_max.set(max);
+        let scroll = app.help_scroll.min(max);
+        let hint = if max > 0 { " j/k 捲動　Esc 關閉 " } else { " Esc 關閉 " };
+        let mut block = pane(Line::from(Span::styled(" 按鍵 ", bold)), true, accent)
+            .title_bottom(Line::from(hint).right_aligned());
+        if scroll < max {
+            block = block.title_bottom(Line::from(Span::styled(" ↓ 下面還有 ", Style::new().fg(accent))));
+        }
         let inner = block.inner(area);
+        f.render_widget(Clear, area);
         f.render_widget(block, area);
         for (i, lines) in cols.into_iter().enumerate() {
             let x = inner.x + i as u16 * COL_W;
             let col = Rect { x, width: COL_W.min(inner.right().saturating_sub(x)), ..inner };
-            f.render_widget(Paragraph::new(lines), col);
+            f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), col);
         }
     }
 }
@@ -2300,6 +2312,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         pending_mentions: Vec::new(),
         all_chats: vec![],
         help: false,
+        help_scroll: 0,
+        help_max: std::cell::Cell::new(0),
         attach: None,
         path_prompt: None,
         theme: Theme::load(),
@@ -2413,6 +2427,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             app.on_paste(text);
             continue;
         }
+        // 說明開著時滾輪捲說明。
+        if let (true, Event::Mouse(m)) = (app.help, &ev) {
+            let max = app.help_max.get();
+            match m.kind {
+                MouseEventKind::ScrollDown => app.help_scroll = app.help_scroll.saturating_add(3).min(max),
+                MouseEventKind::ScrollUp => app.help_scroll = app.help_scroll.saturating_sub(3),
+                _ => {}
+            }
+            continue;
+        }
         // 浮層開著時滑鼠不作用，免得點穿到底下的清單。
         if matches!(ev, Event::Mouse(_)) && (app.help || app.search.is_some() || app.msg_search.is_some() || app.path_prompt.is_some() || app.react_picker || app.mention.is_some()) {
             continue;
@@ -2499,13 +2523,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             continue;
         }
-        // 說明：任何鍵都是關掉它。
+        // 說明：可以捲（小螢幕放不下整份），Esc／q／?／F1／Enter 關閉。
         if app.help {
-            app.help = false;
+            let max = app.help_max.get();
+            let page = 10;
+            app.help_scroll = match key.code {
+                KeyCode::Char('j') | KeyCode::Down => app.help_scroll.saturating_add(1),
+                KeyCode::Char('k') | KeyCode::Up => app.help_scroll.saturating_sub(1),
+                KeyCode::PageDown | KeyCode::Char(' ') => app.help_scroll.saturating_add(page),
+                KeyCode::PageUp => app.help_scroll.saturating_sub(page),
+                KeyCode::Home | KeyCode::Char('g') => 0,
+                KeyCode::End | KeyCode::Char('G') => max,
+                KeyCode::Esc | KeyCode::Enter | KeyCode::F(1) | KeyCode::Char('q') | KeyCode::Char('?') => {
+                    app.help = false;
+                    app.help_scroll
+                }
+                _ => app.help_scroll,
+            }
+            .min(max);
             continue;
         }
         if key.code == KeyCode::F(1) {
             app.help = true;
+            app.help_scroll = 0;
             continue;
         }
         // 表情選單：數字選，其他鍵取消。
@@ -2753,7 +2793,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         'k' => app.selected = app.selected.saturating_sub(1),
                         'r' => app.load_chats(),
                         '/' => app.start_search(),
-                        '?' => app.help = true,
+                        '?' => {
+                            app.help = true;
+                            app.help_scroll = 0;
+                        }
                         'q' => break Ok(()),
                         _ => {}
                     }
