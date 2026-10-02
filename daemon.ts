@@ -14,12 +14,12 @@
 import { createServer, connect as netConnect, type Socket } from "node:net";
 import qrcode from "qrcode-terminal";
 import { appendFileSync, chmodSync, closeSync, existsSync, mkdirSync, readFileSync, openSync, readdirSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
-import { execFile } from "node:child_process";
+import { type ChildProcess, execFile } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { type Chat, type ChatEvent, Line, type Msg } from "./line.js";
 import { ARCHIVE_FILE, SOCK, STATE_DIR, STATE_FILE } from "./paths.js";
-import { isVip, vipAlertArgs } from "./vip.js";
+import { isVip, MAC_REPLY_BUTTON, macAlertArgs, vipAlertArgs } from "./vip.js";
 
 const RESYNC_MS = 60_000;      // 定期跟伺服器對齊未讀數
 const SQUARE_MS = 10_000;      // OpenChat 只能自己拉，理由見 line.ts squareMessages()
@@ -60,12 +60,16 @@ let state: State = {
   vip: [],
 };
 let line: Line | undefined;
+/** macOS 開著的 VIP 對話框，一個聊天室一個（見 macAlert）。writeState 會用到，所以宣告在這。 */
+const macAlerts = new Map<string, ChildProcess>();
 
 function writeState() {
   state.updatedAt = Date.now();
   // VIP 提醒留到那個聊天室被讀了為止 —— 不管是在這台、在手機上讀的（resync 會把 unread
   // 對齊成 0），都算。每次寫 state 都順手清，不必在每個會動 unread 的地方各寫一次。
   state.vip = state.vip.filter((a) => (state.chats.find((c) => c.mid === a.chat)?.unread ?? 0) > 0);
+  // macOS 的對話框跟著一起收：讀過（或那則被收回）就關掉，跟 omarchy 的大卡片一樣。
+  for (const [chat, dialog] of macAlerts) if (!state.vip.some((a) => a.chat === chat)) dialog.kill();
   // 先寫暫存再 rename：讀的人（FileView）不會看到寫到一半的檔案。
   const tmp = `${STATE_FILE}.tmp`;
   writeFileSync(tmp, JSON.stringify(state, null, 2));
@@ -292,7 +296,7 @@ function onIncoming(m: Msg, caughtUp = false) {
       const name = chat?.name ?? m.fromName;
       state.vip = [...state.vip, { id: m.id, chat: m.chat, name, from: m.fromName, text, time: m.time }]
         .slice(-VIP_ALERTS_MAX);
-      if (!hasOverlay()) alertVip(name, m.fromName, text);
+      if (!hasOverlay()) alertVip(m.chat, name, m.fromName, text);
     }
   }
 
@@ -393,16 +397,37 @@ let viewing: { chat: string; until: number } | undefined;
 /**
  * 沒有大彈窗可用時的退路：一個不會自己消失的系統通知（大小由桌面決定，我們管不了）。
  * 由 daemon 發而不是介面發 —— 介面沒開、縮小、沒焦點的時候才是最需要它的時候。
- * ponytail: 只有 notify-send（Linux）。macOS 沒有對應的「不會消失」通知，要用到再想。
+ * Linux 用 notify-send，macOS 用 osascript 的對話框（見 macAlert）。
  */
 let warnedNoNotify = false;
-function alertVip(chatName: string, fromName: string, preview: string) {
+function alertVip(chat: string, chatName: string, fromName: string, preview: string) {
+  if (process.platform === "darwin") return macAlert(chat, chatName, fromName, preview);
   execFile("notify-send", vipAlertArgs(chatName, fromName, preview), (err) => {
     if (!err || warnedNoNotify) return;
     warnedNoNotify = true; // 沒裝的話每則都會失敗，講一次就好
     console.warn("VIP 提醒發不出去：", (err as NodeJS.ErrnoException).code === "ENOENT"
       ? "沒有 notify-send（libnotify）" : err.message);
   });
+}
+
+/**
+ * 每個聊天室最多一個對話框（macAlerts）：連發十則不該疊十個。對話框開著的期間，後面的訊息只進 state.vip。
+ * 按「前往回覆」就寫 open-request，TUI 會打開那個聊天室（沒開著的話，下次啟動時開）。
+ */
+function macAlert(chat: string, chatName: string, fromName: string, preview: string) {
+  if (macAlerts.has(chat)) return;
+  const dialog = execFile("osascript", macAlertArgs(chatName, fromName, preview), (err, stdout) => {
+    macAlerts.delete(chat);
+    if (err) {
+      // 被 writeState 收掉的（聊天室讀過了）不算錯
+      if (!dialog.killed) console.warn("VIP 提醒發不出去：", err.message);
+      return;
+    }
+    if (stdout.trim() === MAC_REPLY_BUTTON) {
+      writeFileSync(join(STATE_DIR, "open-request"), `${chat}\t${chatName}\n`);
+    }
+  });
+  macAlerts.set(chat, dialog);
 }
 
 // ------------------------------------------------------------------ 對帳

@@ -76,6 +76,16 @@ assert.equal(safeExt("a.sh\n"), undefined);
   const dash = vipAlertArgs("--help", "--help", "x");
   assert.ok(dash.indexOf("--") < dash.indexOf("★ --help"));
 
+  // macOS：標題與內文走 argv，不進 AppleScript 原始碼；沒有標記語言，所以不跳脫。
+  const { macAlertArgs } = await import("./vip.js");
+  const evil = 'x" & (do shell script "id") & "';
+  const mac = macAlertArgs("家人", "媽", `<b>${evil}</b>\u001b\n下一行`);
+  assert.equal(mac[0], "-e");
+  assert.ok(!mac[1].includes(evil) && !mac[1].includes("家人"));
+  assert.equal(mac[2], "★ 家人｜媽");
+  assert.equal(mac[3], `<b>${evil}</b>\n下一行`);
+  assert.equal(macAlertArgs("a", "a", "x".repeat(500))[3].length, 200);
+
   // 名單：一行一個 mid，前後空白不算，沒有檔案就是沒有 VIP。
   const { writeFileSync, rmSync } = await import("node:fs");
   assert.ok(VIP_FILE.startsWith(process.env.ENIL_STATE_DIR!));

@@ -17,16 +17,39 @@ export function isVip(chat: string): boolean {
 }
 
 /**
- * notify-send 的參數。critical 的通知不會自己消失，要人按掉；在 omarchy 上還會繞過
+ * Linux：notify-send 的參數。critical 的通知不會自己消失，要人按掉；在 omarchy 上還會繞過
  * 勿擾模式 —— 但那條規則認的是 app 名稱 "notify-send"，所以**不要加 -a**。
  *
  * 內文會被通知系統當成標記語言解析，而它是別人寫的：控制字元拿掉，< > & 跳脫。
  */
 export function vipAlertArgs(chatName: string, fromName: string, preview: string): string[] {
+  const { title, body } = alertText(chatName, fromName, preview);
+  const markup = body.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  // "--" 之後的都是位置參數：標題是別人取的名字，不能讓它被當成選項。
+  return ["-u", "critical", "--", title, markup];
+}
+
+export const MAC_REPLY_BUTTON = "前往回覆";
+
+/**
+ * macOS 的對應物：osascript 的 display alert，按下按鈕才會消失，跟 critical 的 notify-send 一樣。
+ * 回傳按下的按鈕名稱（stdout）。
+ *
+ * 標題與內文走 argv，不拼進 AppleScript 字串 —— 別人寫的引號拼進去就是對你的電腦下指令。
+ */
+export function macAlertArgs(chatName: string, fromName: string, preview: string): string[] {
+  const { title, body } = alertText(chatName, fromName, preview);
+  const script = [
+    "on run argv",
+    `  return button returned of (display alert (item 1 of argv) message (item 2 of argv) as critical ` +
+      `buttons {"關閉", "${MAC_REPLY_BUTTON}"} default button "${MAC_REPLY_BUTTON}")`,
+    "end run",
+  ].join("\n");
+  return ["-e", script, title, body];
+}
+
+function alertText(chatName: string, fromName: string, preview: string) {
   const clean = (s: string) => s.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "");
   const title = fromName && fromName !== chatName ? `★ ${chatName}｜${fromName}` : `★ ${chatName}`;
-  const body = clean(preview).slice(0, 200)
-    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  // "--" 之後的都是位置參數：標題是別人取的名字，不能讓它被當成選項。
-  return ["-u", "critical", "--", clean(title), body];
+  return { title: clean(title), body: clean(preview).slice(0, 200) };
 }
