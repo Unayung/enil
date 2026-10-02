@@ -746,8 +746,14 @@ impl App {
     fn apply(&mut self, u: Update) {
         match u {
             Update::Chats(c) => {
+                // 選取要跟著聊天室走，不是跟著位置。清單每分鐘重整一次，期間誰收到新訊息
+                // 誰就排到前面 —— 只記位置的話，選取會自己跳到別的聊天室，右邊的預覽也跟著換
+                // （「沒人碰，TUI 自己換了聊天室」就是這個）。所以先記住是哪一個，換完再找回來。
+                let keep = self.chats.get(self.selected).map(|c| c.mid.clone());
                 self.chats = c;
-                if self.selected >= self.chats.len() {
+                if let Some(i) = keep.and_then(|mid| self.chats.iter().position(|c| c.mid == mid)) {
+                    self.selected = i;
+                } else if self.selected >= self.chats.len() {
                     self.selected = self.chats.len().saturating_sub(1);
                 }
                 self.pin_vips();
