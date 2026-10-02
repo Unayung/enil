@@ -138,8 +138,12 @@ LINE 伺服器對次要裝置只保留約兩週的歷史。daemon 會把收到�
 在 TUI 裡對某個聊天室按 `Ctrl-P` 設成 VIP（名單存在 `~/.local/state/enil/vip`，一行一個
 mid）。VIP 的新訊息一定要被看到，所以提醒是 daemon 發的，TUI 沒開也一樣：
 
-- 有裝 omarchy 外掛：螢幕中央彈一張大卡片，蓋在所有視窗上，讀過那個聊天室才消失。
-- 沒有：`notify-send -u critical`，不會自己消失的系統通知（需要 libnotify）。
+- 有 omarchy 外掛在畫：螢幕中央彈一張大卡片，蓋在所有視窗上，讀過那個聊天室才消失。
+- 沒有：`notify-send -u critical`，不會自己消失的系統通知（需要 libnotify）；macOS 是對話框。
+
+「有沒有外掛在畫」看的是 state 目錄的 `overlay-ok`：外掛的彈窗真的載起來時，每分鐘碰它一次。
+超過 150 秒沒更新（外掛沒裝、彈窗載入失敗、shell 掛了）daemon 就自己發系統通知。
+還沒讀的提醒存在 `state.json` 的 `vip`，daemon 重開會讀回來。
 - macOS：一個對話框，圖示是發話者的大頭貼（沒有就用 LINE 的圖示），按了才消失，讀過那個
   聊天室也會自己關。一個聊天室同時只有一個。
   按「前往回覆」，TUI 會打開那個聊天室（TUI 沒開的話，下次開的時候）。

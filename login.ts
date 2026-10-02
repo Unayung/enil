@@ -30,7 +30,22 @@ export interface LoginOptions {
 
 /** 快取憑證不可用、且呼叫端沒允許 QR 時丟這個。 */
 export class NeedsQrLogin extends Error {
-  constructor() { super("需要 QR 登入（沒有可用的快取憑證）"); }
+  /** reason：給人看的原因（快取憑證為什麼不能用）。沒有就是根本沒有快取憑證。 */
+  constructor(readonly reason?: string) { super(reason ?? "需要 QR 登入（沒有可用的快取憑證）"); }
+}
+
+/**
+ * 快取憑證換不到新 token 的原因，講成人話。被拒（INVALID_REQUEST 之類）幾乎都是這個帳號在
+ * 別台機器登入了 enil —— LINE 對次要裝置有上限，後登入的會把先登入的踢掉；網路問題則是
+ * 憑證還好好的，不該叫人重掃 QR。
+ */
+export function refreshFailureReason(err: unknown): string {
+  const msg = String((err as Error)?.message ?? err);
+  if (/INVALID_REQUEST|NOT_AUTHORIZED_DEVICE|LOGGED_OUT|AUTHENTICATION_FAILED/.test(msg)) {
+    return "這台的登入已被取消（可能在別台機器登入了 enil，或在手機上把這個裝置登出了）。" +
+      "要在這台用就重新登入 —— 會把另一台踢掉。";
+  }
+  return `換發憑證失敗（${msg.slice(0, 120)}）。如果是網路問題，網路恢復後重啟 daemon 即可，不必重新登入。`;
 }
 
 const terminalHandlers: Required<LoginHandlers> = {
@@ -140,8 +155,8 @@ export async function login(
   opts: LoginOptions = {},
 ): Promise<Client> {
   const qrAllowed = opts.qrAllowed ?? false;
-  const needQr = () => {
-    if (!qrAllowed) throw new NeedsQrLogin();
+  const needQr = (reason?: string) => {
+    if (!qrAllowed) throw new NeedsQrLogin(reason);
     return qrLogin(handlers);
   };
   // E2EE 金鑰只在 QR 登入時更新，所以要強迫走那條路時用：LINE_FORCE_QR=1
@@ -164,7 +179,7 @@ export async function login(
     return new Client(base);
   } catch (err) {
     console.warn("⚠️  refresh 失敗：", (err as Error)?.message ?? err);
-    return needQr();
+    return needQr(refreshFailureReason(err));
   }
 }
 

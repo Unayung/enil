@@ -117,4 +117,13 @@ assert.equal(reactionName("LOVE"), "LOVE");
 assert.equal(reactionName(99), "99");
 assert.equal(reactionName(undefined), "OTHER"); // 自訂／付費回應
 
+// 快取憑證換不到 token 的原因：被別台踢掉要叫人重新登入，網路問題不要。
+{
+  const { refreshFailureReason } = await import("./login.js");
+  const kicked = refreshFailureReason(new Error('refresh -> {"accessTokenRefreshException":{"errorCode":"INVALID_REQUEST","reasonCode":2}}'));
+  assert.ok(kicked.includes("別台機器") && kicked.includes("重新登入"));
+  const net = refreshFailureReason(new Error("connect ETIMEDOUT 147.92.185.2:443"));
+  assert.ok(net.includes("網路") && net.includes("不必重新登入") && net.includes("ETIMEDOUT"));
+}
+
 console.log("ok");

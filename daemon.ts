@@ -13,11 +13,12 @@
 // 必須透過 state 交給 UI 顯示，否則第一次登入根本做不到。
 import { createServer, connect as netConnect, type Socket } from "node:net";
 import qrcode from "qrcode-terminal";
-import { appendFileSync, chmodSync, closeSync, existsSync, mkdirSync, readFileSync, openSync, readdirSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, closeSync, existsSync, mkdirSync, readFileSync, openSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { type ChildProcess, execFile } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { type Chat, type ChatEvent, Line, type Msg } from "./line.js";
+import { NeedsQrLogin } from "./login.js";
 import { ARCHIVE_FILE, SOCK, STATE_DIR, STATE_FILE } from "./paths.js";
 import { isVip, MAC_REPLY_BUTTON, macAlertArgs, vipAlertArgs } from "./vip.js";
 
@@ -70,7 +71,10 @@ function writeState() {
   state.updatedAt = Date.now();
   // VIP 提醒留到那個聊天室被讀了為止 —— 不管是在這台、在手機上讀的（resync 會把 unread
   // 對齊成 0），都算。每次寫 state 都順手清，不必在每個會動 unread 的地方各寫一次。
-  state.vip = state.vip.filter((a) => (state.chats.find((c) => c.mid === a.chat)?.unread ?? 0) > 0);
+  // 聊天室清單還沒拿到（剛啟動、還沒登入）時不篩：那時誰都是 0 未讀，會把讀回來的提醒全清掉。
+  if (state.chats.length) {
+    state.vip = state.vip.filter((a) => (state.chats.find((c) => c.mid === a.chat)?.unread ?? 0) > 0);
+  }
   // macOS 的對話框跟著一起收：讀過（或那則被收回）就關掉，跟 omarchy 的大卡片一樣。
   for (const [chat, dialog] of macAlerts) if (!state.vip.some((a) => a.chat === chat)) dialog?.kill();
   // 先寫暫存再 rename：讀的人（FileView）不會看到寫到一半的檔案。
@@ -390,12 +394,21 @@ function onChatEvent(ev: ChatEvent) {
 const VIP_ALERTS_MAX = 20;
 
 /**
- * 有沒有東西會把 state.vip 畫成大彈窗。目前唯一會畫的是 omarchy 外掛（omarchy-line），
- * 所以看它裝了沒。有的話就不另外發 notify-send，不然同一則訊息會跳兩個東西。
- * ponytail: 直接認外掛的安裝路徑。出現第二種會畫彈窗的消費者時，改成讓它們自己登記。
+ * 有沒有東西正在把 state.vip 畫成大彈窗。有的話就不另外發系統通知，不然同一則訊息會跳兩個。
+ *
+ * 畫彈窗的一方（omarchy 外掛）要自己回報：彈窗真的載起來時，每分鐘碰一次 state 目錄的
+ * overlay-ok。這裡看它的修改時間 —— 外掛沒裝、彈窗載入失敗（例如某版 omarchy 少了用到的元件）、
+ * shell 掛了，檔案都會停止更新，就退回系統通知。以前只看外掛的檔案存不存在，外掛壞掉時
+ * daemon 仍以為有彈窗，VIP 訊息變成哪裡都沒提醒（實際發生過）。
  */
+const OVERLAY_BEAT = join(STATE_DIR, "overlay-ok");
+const OVERLAY_STALE_MS = 150_000; // 外掛每 60 秒回報一次，兩次沒到就算不在
 function hasOverlay(): boolean {
-  return existsSync(join(homedir(), ".config/omarchy/plugins/io.github.unayung.line/Widget.qml"));
+  try {
+    return Date.now() - statSync(OVERLAY_BEAT).mtimeMs < OVERLAY_STALE_MS;
+  } catch {
+    return false;
+  }
 }
 
 // 使用者正盯著的聊天室。介面每 10 秒回報一次，所以期限抓寬一點。
@@ -521,6 +534,23 @@ async function catchUp(chats: Chat[]) {
   }
 }
 
+/**
+ * 被踢：伺服器說這台不再被授權（多半是在別台機器登入了 enil）。憑證已經沒用了，重開也一樣，
+ * 所以不重開，停在「要重新登入」並把原因寫進 state，TUI 的登入畫面會顯示。
+ * 可能從兩條路進來（linejs 的 "end"、或沒被接住的 NOT_AUTHORIZED_DEVICE），要能重複呼叫。
+ */
+function onKicked(detail: string) {
+  if (!line && state.login.status !== "ok") return;
+  console.error("這台裝置的登入被取消了：", detail);
+  line = undefined;
+  state.login = {
+    status: "idle",
+    error: "這台的登入已被取消（可能在別台機器登入了 enil，或在手機上把這個裝置登出了）。" +
+      "要在這台用就重新登入 —— 會把另一台踢掉。",
+  };
+  writeState();
+}
+
 /** 推送救不回來：結束 process，讓 systemd（Restart=on-failure）重開、用快取憑證重新登入。 */
 function restart(reason: string) {
   console.error(`推送失效（${reason}），5 秒後重啟 daemon`);
@@ -548,6 +578,12 @@ async function claimSocket(): Promise<void> {
 // ------------------------------------------------------------------ 啟動
 
 mkdirSync(STATE_DIR, { recursive: true });
+// 上一次還沒讀的 VIP 提醒：只放在記憶體的話，daemon 一重開就沒了，而那則訊息已經存檔過，
+// 補抓時也不會再當成新的 —— 提醒就這樣被吞掉。從上次的 state 讀回來。
+try {
+  const prev = JSON.parse(readFileSync(STATE_FILE, "utf8"));
+  if (Array.isArray(prev.vip)) state.vip = prev.vip;
+} catch { /* 第一次跑，或檔案壞了 */ }
 try {
   await claimSocket();
 } catch (err) {
@@ -655,24 +691,16 @@ async function startLogin(force: boolean): Promise<void> {
     line.onMessage((m) => onIncoming(m));
     line.onEvents(onChatEvent);
     line.onAnyOp(tallyOp);
-    line.onTrouble((kind, detail) => {
-      if (kind === "push-dead") return restart(detail);
-      // 被踢：憑證已經沒用了，重開也一樣。停在「要重新登入」，等人處理。
-      console.error("這台裝置的登入被取消了：", detail);
-      line = undefined;
-      state.login = {
-        status: "error",
-        error: "這台裝置的登入被取消了（可能在別台機器登入了 enil，或在手機上登出）。重新登入即可。",
-      };
-      writeState();
-    });
+    line.onTrouble((kind, detail) => kind === "push-dead" ? restart(detail) : onKicked(detail));
   } catch (err) {
     clearQr();
     const message = (err as Error)?.message ?? String(err);
     if (!force) {
-      // 沒有可用的快取憑證。不自作主張開 QR —— 等人按登入。
-      state.login = { status: "idle" };
-      console.log("沒有可用的憑證。開 enil-tui 登入，或跑 cli.ts login。");
+      // 快取憑證不能用（沒有、被拒、或網路問題）。不自作主張開 QR —— 等人按登入。
+      // 原因要寫進 state：TUI 的登入畫面會顯示，人才知道是被別台踢了還是網路斷了。
+      const reason = err instanceof NeedsQrLogin ? err.reason : undefined;
+      state.login = reason ? { status: "idle", error: reason } : { status: "idle" };
+      console.log(reason ?? "沒有可用的憑證。開 enil-tui 登入，或跑 cli.ts login。");
     } else {
       console.warn("登入失敗：", message);
       state.login = { status: "error", error: message + "（再按一次登入可重試）" };
@@ -710,6 +738,17 @@ setInterval(async () => {
 seedKnownFromArchive();
 // 啟動只試快取憑證；沒有就停在 idle 等人按登入。
 void startLogin(false);
+
+// linejs 背景的 noop（連線檢查）失敗時沒有 .catch —— 被踢的那一刻，NOT_AUTHORIZED_DEVICE 會從
+// 這裡冒出來，以前整個 daemon 就當掉、重開後只說「沒有可用的憑證」。那種當成被踢處理；
+// 其他沒被接住的錯誤照舊結束 process（Node 的預設行為），讓 systemd 重開。
+process.on("unhandledRejection", (err) => {
+  const data = (err as any)?.data;
+  if (data?.code === "NOT_AUTHORIZED_DEVICE") return onKicked(String(data.reason ?? data.code));
+  console.error("未處理的錯誤：", err);
+  flushOpStats();
+  process.exit(1);
+});
 
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
   process.on(sig, () => {
