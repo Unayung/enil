@@ -32,20 +32,32 @@ export function vipAlertArgs(chatName: string, fromName: string, preview: string
 export const MAC_REPLY_BUTTON = "前往回覆";
 
 /**
- * macOS 的對應物：osascript 的 display alert，按下按鈕才會消失，跟 critical 的 notify-send 一樣。
- * 回傳按下的按鈕名稱（stdout）。
+ * macOS 的對應物：osascript 的 display dialog，按下按鈕才會消失，跟 critical 的 notify-send 一樣；
+ * 也會浮在其他視窗上面（實測：切到別的 app 仍蓋在上面）。回傳按下的按鈕名稱（stdout）。
  *
- * 標題與內文走 argv，不拼進 AppleScript 字串 —— 別人寫的引號拼進去就是對你的電腦下指令。
+ * 用 display dialog 而不是 display alert：只有它能換圖示。icons 是圖檔路徑，依序試，第一個
+ * 讀得了的就用；全都不行才用 caution。不用 note：osascript 沒有自己的 app 圖示，
+ * note 在 macOS 上畫出來是一個資料夾（實測）。圖示壞掉不能讓整個提醒不見。
+ *
+ * 標題、內文、圖示路徑都走 argv，不拼進 AppleScript 字串 —— 別人寫的引號拼進去就是對你的電腦下指令。
  */
-export function macAlertArgs(chatName: string, fromName: string, preview: string): string[] {
+export function macAlertArgs(chatName: string, fromName: string, preview: string, icons: string[]): string[] {
   const { title, body } = alertText(chatName, fromName, preview);
+  const dialog = (withIcon: string) =>
+    `return button returned of (display dialog (item 2 of argv) with title (item 1 of argv) ` +
+    `with icon ${withIcon} buttons {"關閉", "${MAC_REPLY_BUTTON}"} default button "${MAC_REPLY_BUTTON}")`;
   const script = [
     "on run argv",
-    `  return button returned of (display alert (item 1 of argv) message (item 2 of argv) as critical ` +
-      `buttons {"關閉", "${MAC_REPLY_BUTTON}"} default button "${MAC_REPLY_BUTTON}")`,
+    "  repeat with i from 3 to count of argv",
+    "    try",
+    `      ${dialog("(POSIX file (item i of argv))")}`,
+    "    end try",
+    "  end repeat",
+    `  ${dialog("caution")}`,
     "end run",
   ].join("\n");
-  return ["-e", script, title, body];
+  // 空字串會被 POSIX file 當成根目錄，畫出資料夾而不是報錯，所以先拿掉。
+  return ["-e", script, title, body, ...icons.filter(Boolean)];
 }
 
 function alertText(chatName: string, fromName: string, preview: string) {

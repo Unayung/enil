@@ -428,6 +428,11 @@ export class Line {
     return mids.map((mid) => ({ mid, name: this.#names.get(mid) ?? mid.slice(0, 8) }));
   }
 
+  /** 某人的大頭貼（本機路徑）。推送來的訊息不帶 fromAvatar，要的人自己問（VIP 對話框）。 */
+  avatar(mid: string): Promise<string | undefined> {
+    return this.#avatarOf(mid);
+  }
+
   /** 每一個推送來的 Operation 的類型（字串；linejs 不認得的是數字）。觀察用。 */
   onAnyOp(cb: (type: string, op: any) => void): void {
     this.#client.on("event", (op: any) => {

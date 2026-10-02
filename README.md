@@ -140,7 +140,8 @@ mid）。VIP 的新訊息一定要被看到，所以提醒是 daemon 發的，TU
 
 - 有裝 omarchy 外掛：螢幕中央彈一張大卡片，蓋在所有視窗上，讀過那個聊天室才消失。
 - 沒有：`notify-send -u critical`，不會自己消失的系統通知（需要 libnotify）。
-- macOS：一個對話框，按了才消失，讀過那個聊天室也會自己關。一個聊天室同時只有一個。
+- macOS：一個對話框，圖示是發話者的大頭貼（沒有就用 LINE 的圖示），按了才消失，讀過那個
+  聊天室也會自己關。一個聊天室同時只有一個。
   按「前往回覆」，TUI 會打開那個聊天室（TUI 沒開的話，下次開的時候）。
 
 正開著那個聊天室、而且 TUI 有焦點時不提醒。
@@ -171,8 +172,9 @@ omarchy plugin add https://github.com/Unayung/omarchy-line.git --enable
   "chats": [{ "mid": "…", "name": "…", "type": "USER|GROUP|ROOM",
               "unread": 0, "lastTime": 0, "lastText": "…", "lastFrom": "…",
               "avatar": "/…/media/avatar-…" }], // 最近 50 個；avatar 可能沒有
-  "vip": [{ "id": "…", "chat": "…", "name": "…", "from": "…", "text": "…", "time": 0 }]
-                                                // VIP 還沒被讀的訊息，聊天室讀過就移除
+  "vip": [{ "id": "…", "chat": "…", "name": "…", "from": "…", "text": "…", "time": 0,
+            "avatar": "/…/media/avatar-…" }]    // VIP 還沒被讀的訊息，聊天室讀過就移除；
+                                                // avatar 是發話者的，事後才補上，可能沒有
 }
 ```
 

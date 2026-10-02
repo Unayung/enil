@@ -48,6 +48,8 @@ interface VipAlert {
   name: string;
   /** 發話者（一對一時跟 name 一樣） */
   from: string;
+  /** 發話者的大頭貼（本機路徑）。是事後補上的（要抓圖），也可能一直沒有。 */
+  avatar?: string;
   text: string;
   time: number;
 }
@@ -60,8 +62,9 @@ let state: State = {
   vip: [],
 };
 let line: Line | undefined;
-/** macOS 開著的 VIP 對話框，一個聊天室一個（見 macAlert）。writeState 會用到，所以宣告在這。 */
-const macAlerts = new Map<string, ChildProcess>();
+/** macOS 開著的 VIP 對話框，一個聊天室一個（見 macAlert）。writeState 會用到，所以宣告在這。
+ *  值是 undefined 表示還在抓大頭貼、對話框還沒開。 */
+const macAlerts = new Map<string, ChildProcess | undefined>();
 
 function writeState() {
   state.updatedAt = Date.now();
@@ -69,7 +72,7 @@ function writeState() {
   // 對齊成 0），都算。每次寫 state 都順手清，不必在每個會動 unread 的地方各寫一次。
   state.vip = state.vip.filter((a) => (state.chats.find((c) => c.mid === a.chat)?.unread ?? 0) > 0);
   // macOS 的對話框跟著一起收：讀過（或那則被收回）就關掉，跟 omarchy 的大卡片一樣。
-  for (const [chat, dialog] of macAlerts) if (!state.vip.some((a) => a.chat === chat)) dialog.kill();
+  for (const [chat, dialog] of macAlerts) if (!state.vip.some((a) => a.chat === chat)) dialog?.kill();
   // 先寫暫存再 rename：讀的人（FileView）不會看到寫到一半的檔案。
   const tmp = `${STATE_FILE}.tmp`;
   writeFileSync(tmp, JSON.stringify(state, null, 2));
@@ -294,9 +297,14 @@ function onIncoming(m: Msg, caughtUp = false) {
     const watching = viewing && viewing.chat === m.chat && Date.now() < viewing.until;
     if (!watching) {
       const name = chat?.name ?? m.fromName;
-      state.vip = [...state.vip, { id: m.id, chat: m.chat, name, from: m.fromName, text, time: m.time }]
-        .slice(-VIP_ALERTS_MAX);
-      if (!hasOverlay()) alertVip(m.chat, name, m.fromName, text);
+      const alert: VipAlert = { id: m.id, chat: m.chat, name, from: m.fromName, text, time: m.time };
+      state.vip = [...state.vip, alert].slice(-VIP_ALERTS_MAX);
+      // 推送來的訊息不帶大頭貼，另外抓。抓到再寫一次 state，彈窗（omarchy 的卡片、mac 的對話框）都用它。
+      const avatar = line ? line.avatar(m.from).catch(() => undefined) : Promise.resolve(undefined);
+      void avatar.then((path) => {
+        if (path && state.vip.includes(alert)) { alert.avatar = path; writeState(); }
+      });
+      if (!hasOverlay()) alertVip(m.chat, name, m.fromName, text, avatar);
     }
   }
 
@@ -400,8 +408,9 @@ let viewing: { chat: string; until: number } | undefined;
  * Linux 用 notify-send，macOS 用 osascript 的對話框（見 macAlert）。
  */
 let warnedNoNotify = false;
-function alertVip(chat: string, chatName: string, fromName: string, preview: string) {
-  if (process.platform === "darwin") return macAlert(chat, chatName, fromName, preview);
+function alertVip(chat: string, chatName: string, fromName: string, preview: string,
+                  avatar: Promise<string | undefined>) {
+  if (process.platform === "darwin") return void macAlert(chat, chatName, fromName, preview, avatar);
   execFile("notify-send", vipAlertArgs(chatName, fromName, preview), (err) => {
     if (!err || warnedNoNotify) return;
     warnedNoNotify = true; // 沒裝的話每則都會失敗，講一次就好
@@ -410,13 +419,26 @@ function alertVip(chat: string, chatName: string, fromName: string, preview: str
   });
 }
 
+// 沒有大頭貼時的退路：LINE 的圖示，沒裝 LINE.app 就用系統的「資訊」圖示。
+const MAC_FALLBACK_ICONS = [
+  "/Applications/LINE.app/Contents/Resources/LINE.icns",
+  "/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/AlertNoteIcon.icns",
+];
+
 /**
  * 每個聊天室最多一個對話框（macAlerts）：連發十則不該疊十個。對話框開著的期間，後面的訊息只進 state.vip。
  * 按「前往回覆」就寫 open-request，TUI 會打開那個聊天室（沒開著的話，下次啟動時開）。
+ * 圖示是發話者的大頭貼；沒有（或讀不了）就照 MAC_FALLBACK_ICONS 的順序退。
  */
-function macAlert(chat: string, chatName: string, fromName: string, preview: string) {
+async function macAlert(chat: string, chatName: string, fromName: string, preview: string,
+                        avatar: Promise<string | undefined>) {
   if (macAlerts.has(chat)) return;
-  const dialog = execFile("osascript", macAlertArgs(chatName, fromName, preview), (err, stdout) => {
+  macAlerts.set(chat, undefined); // 先佔位：抓大頭貼的期間進來的同一聊天室訊息不能再開一個
+  const icon = await avatar;
+  // 抓圖的期間可能已經讀過了（writeState 清掉了提醒），那就不必開
+  if (!state.vip.some((a) => a.chat === chat)) return void macAlerts.delete(chat);
+  const icons = [icon ?? "", ...MAC_FALLBACK_ICONS].filter((p) => p && existsSync(p));
+  const dialog = execFile("osascript", macAlertArgs(chatName, fromName, preview, icons), (err, stdout) => {
     macAlerts.delete(chat);
     if (err) {
       // 被 writeState 收掉的（聊天室讀過了）不算錯
