@@ -72,6 +72,11 @@ pub fn history(chat: &str, count: u32, before: Option<&str>) -> Result<Value, St
     request(req)
 }
 
+/// 預覽：最新一頁，但不標已讀。清單上移動游標時用 —— 只是看一眼，不算讀過。
+pub fn peek(chat: &str, count: u32) -> Result<Value, String> {
+    request(json!({ "cmd": "history", "chat": chat, "count": count }))
+}
+
 /// 下載原檔（不是縮圖），回傳 { path }。
 pub fn download(message_id: &str) -> Result<Value, String> {
     request(json!({ "cmd": "download", "messageId": message_id, "preview": false }))

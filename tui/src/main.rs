@@ -26,7 +26,7 @@ use ratatui::widgets::{
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::{Protocol, StatefulProtocol};
 use ratatui_image::{Resize, StatefulImage};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use serde_json::Value;
 use std::io::{stdout, IsTerminal, Write};
 use std::path::Path;
@@ -46,6 +46,8 @@ enum Update {
     Downloaded(String),
     /// 推送連線接上／斷了。
     Online(bool),
+    /// 清單游標所在聊天室的預覽（mid、訊息）。
+    Preview(String, Vec<Msg>),
     /// daemon 有沒有登入 LINE。連得上 socket 不代表有登入。
     Session(bool),
     /// 全部的聊天室（搜尋用；平常的清單只有最近 60 個）。
@@ -73,6 +75,29 @@ impl PathPrompt {
         self.matches = complete_path(&text).1;
         self.text = text;
     }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Sidebar {
+    Full,
+    /// 一行一筆，只有名稱與未讀。
+    Names,
+    /// 不顯示：跟窄視窗一樣一次只看一邊，對話佔滿整個視窗，Esc 回清單。
+    Hidden,
+}
+
+fn vip_path() -> std::path::PathBuf {
+    client::state_dir().join("vip")
+}
+
+fn load_vip() -> HashSet<String> {
+    std::fs::read_to_string(vip_path())
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect()
 }
 
 struct App {
@@ -103,8 +128,24 @@ struct App {
     attach: Option<String>,
     /// Ctrl-F 的路徑輸入框。None 是沒開。
     path_prompt: Option<PathPrompt>,
-    /// Ctrl-B 切換：清單收窄成只有聊天室名稱（一行一筆，沒有預覽與時間）。
-    compact: bool,
+    /// 各聊天室打到一半的字。離開聊天室時收起來，回來時放回輸入框。只在記憶體裡。
+    drafts: HashMap<String, String>,
+    /// 預覽抓過的訊息，依聊天室。同一個聊天室回頭再看就不再問 LINE。
+    /// 不會過期：daemon 會推送每一則新訊息，收到時把那個聊天室丟掉就好（見 Incoming）。
+    peek_cache: HashMap<String, Vec<Msg>>,
+    /// 右邊目前預覽的是哪個聊天室（沒開聊天室時，跟著清單游標）。None = 還沒抓。
+    preview: Option<String>,
+    /// 上一輪看到的游標所在聊天室，與它從什麼時候開始停在那裡。停下來一會兒才抓預覽，
+    /// 快速掃過時不必每個都打一次 LINE。
+    preview_seen: Option<String>,
+    preview_moved: Instant,
+    /// 視窗窄到只能顯示一欄（draw 每一幀更新）。
+    narrow: bool,
+    /// Ctrl-B 輪流切：展開 → 只有名稱 → 隱藏（對話最大化）。
+    sidebar: Sidebar,
+    /// VIP 聊天室的 mid。置頂、通知不會自己消失、未讀永遠顯示在狀態列。存在 state 目錄的
+    /// `vip` 檔（一行一個 mid）—— state 目錄是跟著帳號走的，mid 也是。
+    vip: HashSet<String>,
     theme: Theme,
     tx: Sender<Update>,
     // 上次繪製的版面。滑鼠事件只有座標，要靠這個判斷點到哪一區。
@@ -127,7 +168,7 @@ struct App {
 impl App {
     /// 清單裡一個聊天室佔幾列。滑鼠座標換算成第幾筆要用。
     fn list_item_rows(&self) -> u16 {
-        if self.compact { 1 } else { 2 }
+        if self.sidebar == Sidebar::Names && !self.narrow { 1 } else { 2 }
     }
 
     fn spawn<F>(&self, f: F)
@@ -148,10 +189,83 @@ impl App {
     }
 
     /// 問 daemon 有沒有登入。連不上就當離線，那是另一回事（狀態列會顯示）。
+    ///
+    /// 順便回報「使用者現在正盯著哪個聊天室」：視窗有焦點而且開著的那個，否則是 null。
+    /// daemon 靠這個決定 VIP 的訊息要不要彈系統通知 —— 正在看的不必彈。
+    /// 所以開關聊天室、焦點變化時都要馬上叫一次，不能只靠定期的那一次。
     fn check_session(&self) {
-        self.spawn(|| match client::request(serde_json::json!({ "cmd": "state" })) {
+        let viewing = if self.focused { self.open.clone() } else { None };
+        self.spawn(move || match client::request(serde_json::json!({ "cmd": "state", "viewing": viewing })) {
             Ok(state) => Update::Session(logged_in_mid(&state).is_some()),
             Err(_) => Update::Online(false),
+        });
+    }
+
+    /// VIP 排最前面（VIP 之間、其餘之間都還是照最近活動排）。
+    /// selected 是索引，排完要指回原本那個聊天室。
+    fn pin_vips(&mut self) {
+        let selected = self.chats.get(self.selected).map(|c| c.mid.clone());
+        let vip = &self.vip;
+        self.chats.sort_by_key(|c| !vip.contains(&c.mid)); // 穩定排序，組內順序不變
+        if let Some(i) = selected.and_then(|mid| self.chats.iter().position(|c| c.mid == mid)) {
+            self.selected = i;
+        }
+    }
+
+    /// Ctrl-P：把開著的聊天室（沒開就是清單上選中的那個）設成 VIP，或取消。
+    fn toggle_vip(&mut self) {
+        let target = match &self.open {
+            Some(mid) => Some((mid.clone(), self.open_name.clone())),
+            None => self.chats.get(self.selected).map(|c| (c.mid.clone(), c.name.clone())),
+        };
+        let Some((mid, name)) = target else { return };
+        self.status = if self.vip.remove(&mid) {
+            format!("已取消 VIP：{name}")
+        } else {
+            self.vip.insert(mid);
+            format!("★ {name} 設為 VIP")
+        };
+        let mut lines: Vec<&str> = self.vip.iter().map(String::as_str).collect();
+        lines.sort();
+        if let Err(e) = std::fs::write(vip_path(), lines.join("\n") + "\n") {
+            self.status = format!("VIP 名單存不了：{e}");
+        }
+        self.pin_vips();
+    }
+
+    /// 主迴圈每一輪呼叫：沒開聊天室時，游標停在一個還沒預覽的聊天室上就抓它的訊息。
+    fn update_preview(&mut self) {
+        if self.open.is_some() || self.narrow {
+            return; // 開著聊天室時右邊是那個聊天室；單欄時右邊根本不顯示
+        }
+        let Some(mid) = self.chats.get(self.selected).map(|c| c.mid.clone()) else { return };
+        if self.preview.as_deref() == Some(mid.as_str()) {
+            return;
+        }
+        // 看過的直接用，不必等游標停下來。
+        if let Some(cached) = self.peek_cache.get(&mid) {
+            self.msgs = cached.clone();
+            self.scroll = 0;
+            self.busy = false;
+            self.preview = Some(mid);
+            return;
+        }
+        if self.preview_seen.as_deref() != Some(mid.as_str()) {
+            self.preview_seen = Some(mid);
+            self.preview_moved = Instant::now();
+            return;
+        }
+        if self.preview_moved.elapsed() < Duration::from_millis(200) {
+            return;
+        }
+        // 先清掉上一個的訊息：抓的這段時間右邊顯示「載入中」，不要掛著別人的對話。
+        self.preview = Some(mid.clone());
+        self.msgs.clear();
+        self.busy = true;
+        let me = self.me.clone();
+        self.spawn(move || match client::peek(&mid, 30) {
+            Ok(v) => Update::Preview(mid, model::parse_msgs(&v, &me)),
+            Err(e) => Update::Error(e),
         });
     }
 
@@ -161,7 +275,21 @@ impl App {
         }
     }
 
+    /// 把輸入框收進目前聊天室的草稿，清空輸入框。離開聊天室（切到別的、回清單）時呼叫。
+    fn stash_draft(&mut self) {
+        let text = std::mem::take(&mut self.input);
+        if let Some(mid) = &self.open {
+            if text.trim().is_empty() {
+                self.drafts.remove(mid);
+            } else {
+                self.drafts.insert(mid.clone(), text);
+            }
+        }
+    }
+
     fn open_chat(&mut self, mid: String, name: String) {
+        self.stash_draft();
+        self.input = self.drafts.remove(&mid).unwrap_or_default();
         let me = self.me.clone();
         self.open = Some(mid.clone());
         self.msgs.clear();
@@ -177,6 +305,7 @@ impl App {
         if let Some(chat) = self.chats.iter_mut().find(|c| c.mid == mid) {
             chat.unread = 0;
         }
+        self.check_session();
         self.spawn(move || match client::history(&mid, 40, None) {
             Ok(v) => Update::Messages(model::parse_msgs(&v, &me)),
             Err(e) => Update::Error(e),
@@ -364,6 +493,7 @@ impl App {
                 if self.selected >= self.chats.len() {
                     self.selected = self.chats.len().saturating_sub(1);
                 }
+                self.pin_vips();
                 self.status.clear();
             }
             Update::Downloaded(path) => self.status = system_open(&path),
@@ -376,6 +506,17 @@ impl App {
             }
             Update::Session(logged_in) => self.needs_login = !logged_in,
             Update::AllChats(c) => self.all_chats = c,
+            // 回來時游標可能已經移走、或已經開了聊天室 —— 那就是過期的，丟掉。
+            Update::Preview(mid, m) => {
+                // 游標已經移走也照樣留著：等一下回來看就不用再抓。
+                self.peek_cache.insert(mid.clone(), m.clone());
+                let still = self.open.is_none() && self.chats.get(self.selected).is_some_and(|c| c.mid == mid);
+                if still {
+                    self.msgs = m;
+                    self.scroll = 0;
+                    self.busy = false;
+                }
+            }
             Update::Messages(m) => {
                 self.msgs = m;
                 self.cursor = None; // 索引是舊清單的
@@ -418,11 +559,17 @@ impl App {
                         } else if i > self.selected {
                             self.selected += 1;
                         }
+                        self.pin_vips();
                     }
                     // 不在清單裡（新聊天室，或排在 60 名之外）—— 整個重抓。
                     None => self.load_chats(),
                 }
-                if should_notify(&msg, is_open, self.focused) {
+                // VIP 的提醒是 daemon 發的（不會自己消失的系統通知），這裡再發就重複了。
+                self.peek_cache.remove(&chat);
+                if self.open.is_none() && self.preview.as_deref() == Some(chat.as_str()) {
+                    self.preview = None; // 下一輪 update_preview 會重抓
+                }
+                if should_notify(&msg, is_open, self.focused) && !self.vip.contains(&chat) {
                     notify(&name, &msg);
                 }
                 if is_open && self.scroll == 0 {
@@ -437,6 +584,10 @@ impl App {
             }
             Update::Sent => {
                 self.status.clear();
+                // 推送也會帶回自己送的那則，這裡先丟，免得推送晚到時回清單看到舊的。
+                if let Some(mid) = &self.open {
+                    self.peek_cache.remove(mid);
+                }
                 // 自己送的訊息也會從 listen() 回來，但重讀一次不用等那一拍。
                 self.reload_open();
             }
@@ -742,6 +893,9 @@ fn sender_color(name: &str) -> Color {
     PALETTE[h % PALETTE.len()]
 }
 
+/// 視窗寬度在這以內就改成單欄，清單與對話二選一。
+const NARROW_COLS: u16 = 50;
+
 /// 大頭貼的寬度（格）。高度固定兩列，格子大約是 1:2，所以畫出來接近正方形。
 const AVATAR_W: u16 = 4;
 
@@ -811,9 +965,19 @@ fn draw(f: &mut Frame, app: &mut App) {
     // 上面左右兩欄（清單｜訊息＋輸入列），最底下一整條狀態列。
     let rows = Layout::vertical([Constraint::Min(4), Constraint::Length(1)]).split(f.area());
     let in_chat = app.open.is_some();
-    let compact = app.compact;
-    let cols = Layout::horizontal([Constraint::Length(if compact { 22 } else { 34 }), Constraint::Min(20)])
-        .split(rows[0]);
+    // 窄視窗（50 欄以內）放不下兩欄：一次只顯示一邊，沒開聊天室時是清單，開了就是對話，
+    // Esc 回清單。另一邊的寬度是 0 —— 照樣走過下面的繪製，只是什麼都畫不出來。
+    // tight：視窗真的窄，狀態列的字也要省。single：一次只顯示一邊（窄，或使用者把清單藏起來）。
+    let tight = f.area().width <= NARROW_COLS;
+    let narrow = tight || app.sidebar == Sidebar::Hidden;
+    app.narrow = narrow;
+    let compact = app.sidebar == Sidebar::Names && !narrow;
+    let cols = Layout::horizontal(match (narrow, in_chat) {
+        (true, true) => [Constraint::Length(0), Constraint::Min(0)],
+        (true, false) => [Constraint::Min(0), Constraint::Length(0)],
+        (false, _) => [Constraint::Length(if compact { 22 } else { 34 }), Constraint::Min(20)],
+    })
+    .split(rows[0]);
     let right = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(cols[1]);
     let accent = app.theme.accent;
     let on_accent = app.theme.on_accent;
@@ -842,7 +1006,8 @@ fn draw(f: &mut Frame, app: &mut App) {
                 t if model::day_index(t) == today => model::clock(t),
                 t => model::day_label(t),
             };
-            let name = fit(&c.name, list_w.saturating_sub(3 + lead + when.width()));
+            let label = if app.vip.contains(&c.mid) { format!("★ {}", c.name) } else { c.name.clone() };
+            let name = fit(&label, list_w.saturating_sub(3 + lead + when.width()));
             let name_style = match (selected, c.unread > 0) {
                 (true, _) => Style::new().fg(accent).add_modifier(Modifier::BOLD),
                 (_, true) => Style::new().add_modifier(Modifier::BOLD),
@@ -865,7 +1030,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             let pad2 = list_w.saturating_sub(2 + lead + preview.width() + badge.width());
 
             if compact {
-                let name = fit(&c.name, list_w.saturating_sub(3 + badge.width()));
+                let name = fit(&label, list_w.saturating_sub(3 + badge.width()));
                 let pad = list_w.saturating_sub(2 + name.width() + badge.width());
                 return ListItem::new(Line::from(vec![
                     bar,
@@ -949,13 +1114,24 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     // ---------------------------------------------------------------- 訊息
     let title = app.open.as_ref().map(|_| app.open_name.clone());
+    let preview_name = match (&app.open, &app.preview) {
+        (None, Some(mid)) => app.chats.iter().find(|c| &c.mid == mid).map(|c| c.name.clone()),
+        _ => None,
+    };
     let mut msg_block = pane(
         match &title {
             Some(name) => Line::from(Span::styled(
                 format!(" {name} "),
                 Style::new().add_modifier(Modifier::BOLD),
             )),
-            None => Line::default(),
+            // 預覽：名稱調暗，加一個「Enter 進入」，看得出還沒進去。
+            None => match &preview_name {
+                Some(name) => Line::from(vec![
+                    Span::styled(format!(" {name} "), dim().add_modifier(Modifier::BOLD)),
+                    Span::styled("· Enter 進入 ", dim()),
+                ]),
+                None => Line::default(),
+            },
         },
         in_chat,
         accent,
@@ -968,10 +1144,12 @@ fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(msg_block, right[0]);
 
     if app.msgs.is_empty() {
-        let note = match (in_chat, app.busy) {
-            (false, _) => "選一個聊天室",
-            (true, true) => "載入中…",
-            (true, false) => "沒有訊息（LINE 只保留約兩週）",
+        let note = if app.busy {
+            "載入中…"
+        } else if !in_chat && app.preview.is_none() {
+            "選一個聊天室"
+        } else {
+            "沒有訊息（LINE 只保留約兩週）"
         };
         let mid = Rect { y: inner.y + inner.height / 2, height: 1.min(inner.height), ..inner };
         f.render_widget(Paragraph::new(note).style(dim()).alignment(Alignment::Center), mid);
@@ -1192,7 +1370,14 @@ fn draw(f: &mut Frame, app: &mut App) {
     } else if app.cursor.is_some() {
         ("選取", keys(&[("Enter", "開啟"), ("Tab", "上一個"), ("⇧Tab", "下一個"), ("Esc", "取消")]))
     } else if in_chat {
-        ("對話", keys(&[("Enter", "送出"), ("^V", "貼上"), ("^F", "附檔"), ("Tab", "選附件 ↗"), ("/", "搜尋"), ("F1", "按鍵"), ("Esc", "返回")]))
+        if tight {
+            // 放不下全部：先給離開這個畫面的鍵，其餘看 F1。
+            ("對話", keys(&[("Esc", "清單"), ("Enter", "送出"), ("F1", "按鍵")]))
+        } else {
+            ("對話", keys(&[("Enter", "送出"), ("^V", "貼上"), ("^F", "附檔"), ("Tab", "選附件 ↗"), ("/", "搜尋"), ("F1", "按鍵"), ("Esc", "返回")]))
+        }
+    } else if tight {
+        ("清單", keys(&[("Enter", "開啟"), ("/", "搜尋"), ("?", "按鍵")]))
     } else {
         ("清單", keys(&[("↑↓", "選擇"), ("Enter", "開啟"), ("/", "搜尋"), ("?", "按鍵"), ("q", "離開")]))
     };
@@ -1203,7 +1388,8 @@ fn draw(f: &mut Frame, app: &mut App) {
         ),
         Span::raw(" "),
     ];
-    if let Some(name) = &title {
+    // 單欄時聊天室名稱已經在外框標題上，這裡不重複。
+    if let Some(name) = title.as_ref().filter(|_| !narrow) {
         left.push(Span::raw(format!("{}  ", fit(name, 24))));
     }
     if app.status.is_empty() {
@@ -1215,8 +1401,27 @@ fn draw(f: &mut Frame, app: &mut App) {
     let (dot, label) = if app.online { (Color::Green, "已連線") } else { (Color::Red, "離線") };
     let link = Line::from(vec![
         Span::styled(" ●", Style::new().fg(dot)),
-        Span::styled(format!(" {label} "), dim()),
+        Span::styled(if tight { " ".to_string() } else { format!(" {label} ") }, dim()),
     ]);
+    // VIP 的未讀：不管現在看的是哪個畫面（對話最大化時看不到清單）都在這裡。
+    let waiting: Vec<&Chat> = app.chats.iter().filter(|c| c.unread > 0 && app.vip.contains(&c.mid)).collect();
+    let link = match waiting.first() {
+        None => link,
+        Some(first) => {
+            let total: i64 = waiting.iter().map(|c| c.unread).sum();
+            let text = match (tight, waiting.len()) {
+                (true, _) => format!(" ★ {total} "),
+                (false, 1) => format!(" ★ {} {total} ", fit(&first.name, 16)),
+                (false, n) => format!(" ★ {} 等 {n} 個 · {total} ", fit(&first.name, 12)),
+            };
+            let mut spans = vec![Span::styled(
+                text,
+                Style::new().fg(on_accent).bg(accent).add_modifier(Modifier::BOLD),
+            )];
+            spans.extend(link.spans);
+            Line::from(spans)
+        }
+    };
     let w = (link.width() as u16).min(rows[1].width);
     f.render_widget(
         Paragraph::new(link),
@@ -1325,56 +1530,84 @@ fn draw_overlays(f: &mut Frame, app: &App) {
     }
 
     if app.help {
-        const HELP: &[(&str, &str)] = &[
-            ("清單", ""),
-            ("↑ ↓  j k", "選聊天室"),
-            ("Enter", "開啟聊天室"),
-            ("/", "搜尋全部聊天室"),
-            ("r", "重整清單"),
-            ("q", "離開"),
-            ("對話", ""),
-            ("Enter", "送出（輸入框有字時）"),
-            ("Tab  ⇧Tab", "選可開啟的訊息（標 ↗），Enter 開啟"),
-            ("PgUp PgDn", "捲動訊息"),
-            ("g", "載入更舊的訊息（輸入框空的時候）"),
-            ("/", "搜尋全部聊天室（輸入框空的時候）"),
-            ("Esc", "取消選取；再按一次回清單"),
-            ("任何時候", ""),
-            ("Ctrl-V", "貼上：圖片或複製的檔案變附件，文字進輸入框"),
-            ("Ctrl-F", "附加檔案（輸入路徑，Tab 補完）"),
-            ("拖檔案進來", "附加那個檔案"),
-            ("Ctrl-B", "清單收窄成只有名稱／展開"),
-            ("F1", "這個說明（清單模式也可以按 ?）"),
-            ("Ctrl-C", "離開"),
-            ("滑鼠", ""),
-            ("點聊天室", "開啟"),
-            ("點 ↗ 訊息", "開啟附件或連結"),
-            ("滾輪", "捲動"),
+        // 分組：每組一個標題加幾個按鍵。高度不夠時整組搬到右欄，組不會被拆開。
+        const HELP: &[(&str, &[(&str, &str)])] = &[
+            ("VIP", &[
+                ("Ctrl-P", "把這個聊天室設為 VIP／取消"),
+                ("", "VIP 置頂；他們的新訊息會在螢幕中央彈大卡片，"),
+                ("", "TUI 沒開、縮小、沒焦點都會彈，讀過才消失"),
+            ]),
+            ("清單", &[
+                ("↑ ↓  j k", "選聊天室"),
+                ("Enter", "開啟聊天室"),
+                ("/", "搜尋全部聊天室"),
+                ("r", "重整清單"),
+                ("q", "離開"),
+            ]),
+            ("對話", &[
+                ("Enter", "送出（輸入框有字時）"),
+                ("Tab  ⇧Tab", "選可開啟的訊息（標 ↗），Enter 開啟"),
+                ("PgUp PgDn", "捲動訊息"),
+                ("g", "載入更舊的訊息（輸入框空的時候）"),
+                ("/", "搜尋全部聊天室（輸入框空的時候）"),
+                ("Esc", "取消選取；再按一次回清單"),
+            ]),
+            ("附件", &[
+                ("Ctrl-V", "貼上：圖片或複製的檔案變附件"),
+                ("Ctrl-F", "附加檔案（輸入路徑，Tab 補完）"),
+                ("拖檔案進來", "附加那個檔案"),
+            ]),
+            ("任何時候", &[
+                ("Ctrl-B", "清單：展開 → 只有名稱 → 隱藏"),
+                ("? 或 F1", "這個說明（聊天時 ? 是字，用 F1）"),
+                ("Ctrl-C", "離開"),
+            ]),
+            ("滑鼠", &[
+                ("點聊天室", "開啟"),
+                ("點 ↗ 訊息", "開啟附件或連結"),
+                ("滾輪", "捲動"),
+            ]),
         ];
-        let area = centered(f.area(), 62, HELP.len() as u16 + 2);
+        let group_lines = |(title, rows): &(&'static str, &'static [(&'static str, &'static str)])| -> Vec<Line<'static>> {
+            let mut out = vec![Line::from(Span::styled(format!(" {title}"), bold.fg(accent)))];
+            out.extend(rows.iter().map(|(key, what)| {
+                let pad = 12usize.saturating_sub(key.width());
+                Line::from(vec![
+                    Span::styled(format!("   {key}{}", " ".repeat(pad)), bold),
+                    Span::raw(*what),
+                ])
+            }));
+            out
+        };
+        const COL_W: u16 = 58;
+        let total: u16 = HELP.iter().map(|(_, rows)| rows.len() as u16 + 1).sum();
+        let screen = f.area();
+        // 一欄放得下就一欄；不然兩欄，左欄放到剛好超過一半為止。
+        let two = total + 2 > screen.height && screen.width >= COL_W * 2 + 3;
+        let mut cols: Vec<Vec<Line>> = vec![vec![]];
+        let half = total.div_ceil(2) as usize;
+        for g in HELP {
+            if two && cols.len() == 1 && cols[0].len() >= half {
+                cols.push(vec![]);
+            }
+            let last = cols.len() - 1;
+            if !cols[last].is_empty() {
+                cols[last].push(Line::default()); // 組與組之間空一行
+            }
+            cols[last].extend(group_lines(g));
+        }
+        let height = cols.iter().map(Vec::len).max().unwrap_or(0) as u16 + 2;
+        let area = centered(screen, COL_W * cols.len() as u16 + 2, height);
         f.render_widget(Clear, area);
-        let lines: Vec<Line> = HELP
-            .iter()
-            .map(|(key, what)| {
-                if what.is_empty() {
-                    // 分組標題
-                    Line::from(Span::styled(format!(" {key}"), bold.fg(accent)))
-                } else {
-                    let pad = 14usize.saturating_sub(key.width());
-                    Line::from(vec![
-                        Span::styled(format!("   {key}{}", " ".repeat(pad)), bold),
-                        Span::raw(*what),
-                    ])
-                }
-            })
-            .collect();
-        f.render_widget(
-            Paragraph::new(lines).block(
-                pane(Line::from(Span::styled(" 按鍵 ", bold)), true, accent)
-                    .title_bottom(Line::from(" 按任意鍵關閉 ").right_aligned()),
-            ),
-            area,
-        );
+        let block = pane(Line::from(Span::styled(" 按鍵 ", bold)), true, accent)
+            .title_bottom(Line::from(" 按任意鍵關閉 ").right_aligned());
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        for (i, lines) in cols.into_iter().enumerate() {
+            let x = inner.x + i as u16 * COL_W;
+            let col = Rect { x, width: COL_W.min(inner.right().saturating_sub(x)), ..inner };
+            f.render_widget(Paragraph::new(lines), col);
+        }
     }
 }
 
@@ -1557,7 +1790,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         focused: true,
         online: false,
         needs_login: false,
-        compact: false,
+        narrow: false,
+        peek_cache: HashMap::new(),
+        drafts: HashMap::new(),
+        preview: None,
+        preview_seen: None,
+        preview_moved: Instant::now(),
+        sidebar: Sidebar::Full,
+        vip: load_vip(),
         open_name: String::new(),
         search: None,
         all_chats: vec![],
@@ -1627,6 +1867,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None => break Ok(()),
             }
         }
+        app.update_preview();
         if last_session.elapsed() > Duration::from_secs(10) {
             last_session = Instant::now();
             app.check_session();
@@ -1643,8 +1884,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let ev = event::read()?;
         match ev {
-            Event::FocusGained => app.focused = true,
-            Event::FocusLost => app.focused = false,
+            Event::FocusGained => {
+                app.focused = true;
+                app.check_session();
+            }
+            Event::FocusLost => {
+                app.focused = false;
+                app.check_session();
+            }
             _ => {}
         }
         if let Event::Paste(text) = ev {
@@ -1725,7 +1972,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             break Ok(());
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('b') {
-            app.compact = !app.compact;
+            app.sidebar = match app.sidebar {
+                Sidebar::Full => Sidebar::Names,
+                Sidebar::Names => Sidebar::Hidden,
+                Sidebar::Hidden => Sidebar::Full,
+            };
             continue;
         }
         // 說明：任何鍵都是關掉它。
@@ -1801,6 +2052,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             continue;
         }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
+            app.toggle_vip();
+            continue;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && app.open.is_some() {
             match key.code {
                 KeyCode::Char('v') => {
@@ -1829,6 +2084,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             KeyCode::Tab if app.open.is_some() => app.move_cursor(true),
             KeyCode::BackTab if app.open.is_some() => app.move_cursor(false),
+            KeyCode::Backspace if app.open.is_none() => {}
             // 輸入框已經空了再按一次，才拿掉附件。
             KeyCode::Backspace if app.input.is_empty() => app.attach = None,
             KeyCode::Backspace => {
@@ -1852,13 +2108,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 app.status.clear();
             }
             KeyCode::Esc => {
+                app.stash_draft();
                 app.open = None;
                 app.attach = None;
                 app.msgs.clear();
+                app.preview = None; // 回清單後重新預覽（剛才讀過，內容可能變了）
+                app.check_session();
             }
             KeyCode::Char(c) => {
-                // 輸入框是空的時候，字母當快捷鍵用；一旦開始打字就全部進輸入框。
-                if app.input.is_empty() && app.open.is_none() {
+                // 清單模式：字母一律是快捷鍵。輸入框屬於聊天室，沒開聊天室時它不存在 ——
+                // 以前這裡還要求輸入框是空的，於是只要有字殘留在輸入框（離開聊天室沒清），
+                // q 之類的鍵就全部被吃進一個看不見的輸入框。
+                if app.open.is_none() {
                     match c {
                         'j' => {
                             if app.selected + 1 < app.chats.len() {
