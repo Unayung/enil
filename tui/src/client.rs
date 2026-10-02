@@ -42,7 +42,8 @@ pub fn request(req: Value) -> Result<Value, String> {
 /// 訂閱 daemon 的推送：一條常駐連線，每則新訊息一行。會一直擋到斷線才回來，
 /// 重連由呼叫端決定。舊版 daemon 不認得 subscribe，只會回一行錯誤然後沒下文 ——
 /// 那行沒有 event 欄位，被濾掉，行為退回純輪詢。
-pub fn subscribe(on_open: impl FnOnce(), mut on_message: impl FnMut(Value)) -> Result<(), String> {
+/// on_event 收到（事件名稱, 資料）：message、read、chat-read、unsend、reaction、edit。
+pub fn subscribe(on_open: impl FnOnce(), mut on_event: impl FnMut(&str, Value)) -> Result<(), String> {
     let mut stream = UnixStream::connect(state_dir().join("sock")).map_err(|e| e.to_string())?;
     stream
         .write_all(b"{\"cmd\":\"subscribe\"}\n")
@@ -51,8 +52,8 @@ pub fn subscribe(on_open: impl FnOnce(), mut on_message: impl FnMut(Value)) -> R
     for line in BufReader::new(stream).lines() {
         let line = line.map_err(|e| e.to_string())?;
         let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
-        if v.get("event").and_then(Value::as_str) == Some("message") {
-            on_message(v.get("data").cloned().unwrap_or(Value::Null));
+        if let Some(event) = v.get("event").and_then(Value::as_str) {
+            on_event(event, v.get("data").cloned().unwrap_or(Value::Null));
         }
     }
     Ok(())
@@ -87,6 +88,20 @@ pub fn send_file(chat: &str, path: &str) -> Result<Value, String> {
     request(json!({ "cmd": "sendFile", "chat": chat, "path": path }))
 }
 
-pub fn send(chat: &str, text: &str) -> Result<Value, String> {
-    request(json!({ "cmd": "send", "chat": chat, "text": text }))
+/// mentions：[{ mid, start, end }]，start／end 是 text 的 UTF-16 索引（LINE 的算法）。
+pub fn send(chat: &str, text: &str, mentions: Value) -> Result<Value, String> {
+    request(json!({ "cmd": "send", "chat": chat, "text": text, "mentions": mentions }))
+}
+
+pub fn unsend(message_id: &str) -> Result<Value, String> {
+    request(json!({ "cmd": "unsend", "messageId": message_id }))
+}
+
+/// type：NICE／LOVE／FUN／AMAZING／SAD／OMG，UNDO 是收回自己的回應。
+pub fn react(message_id: &str, kind: &str) -> Result<Value, String> {
+    request(json!({ "cmd": "react", "messageId": message_id, "type": kind }))
+}
+
+pub fn members(chat: &str) -> Result<Value, String> {
+    request(json!({ "cmd": "members", "chat": chat }))
 }

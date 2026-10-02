@@ -35,6 +35,38 @@ pub struct Msg {
     pub from: String,
     /// 發話者大頭貼的本機路徑。推送來的訊息沒有，靠同一個人先前的訊息補。
     pub avatar_path: Option<String>,
+    /// 自己發的有幾個人讀了。
+    pub read_count: i64,
+    /// 表情回應的種類（NICE、LOVE…），一人一筆。
+    pub reactions: Vec<String>,
+    /// @ 了誰（mid；"all" 是 @所有人）。
+    pub mentions: Vec<String>,
+}
+
+/// 表情回應的種類 → 畫面上的符號。
+pub fn reaction_glyph(kind: &str) -> &'static str {
+    match kind {
+        "NICE" => "👍",
+        "LOVE" => "❤️",
+        "FUN" => "😆",
+        "AMAZING" => "😮",
+        "SAD" => "😢",
+        "OMG" => "😱",
+        _ => "✨", // LINE 的自訂／付費回應
+    }
+}
+
+/// 一則訊息的表情統計，例如「👍 2  ❤️ 1」，出現多的在前。
+pub fn reaction_summary(kinds: &[String]) -> String {
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for k in kinds.iter().filter(|k| k.as_str() != "UNDO") {
+        match counts.iter_mut().find(|(g, _)| *g == reaction_glyph(k)) {
+            Some(c) => c.1 += 1,
+            None => counts.push((reaction_glyph(k), 1)),
+        }
+    }
+    counts.sort_by(|a, b| b.1.cmp(&a.1));
+    counts.iter().map(|(g, n)| if *n > 1 { format!("{g} {n}") } else { g.to_string() }).collect::<Vec<_>>().join("  ")
 }
 
 impl Msg {
@@ -45,6 +77,14 @@ impl Msg {
 
 fn s(v: &Value, k: &str) -> String {
     v.get(k).and_then(Value::as_str).unwrap_or("").to_string()
+}
+
+/// 物件陣列裡每個物件的某個字串欄位，例如 reactions[].type。
+fn strings(v: &Value, k: &str, field: &str) -> Vec<String> {
+    v.get(k)
+        .and_then(Value::as_array)
+        .map(|a| a.iter().map(|x| s(x, field)).collect())
+        .unwrap_or_default()
 }
 
 fn n(v: &Value, k: &str) -> i64 {
@@ -101,6 +141,13 @@ pub fn parse_msgs(v: &Value, me: &str) -> Vec<Msg> {
                         link,
                         from: s(m, "from"),
                         avatar_path: Some(s(m, "fromAvatar")).filter(|p| !p.is_empty()),
+                        read_count: n(m, "readCount"),
+                        reactions: strings(m, "reactions", "type"),
+                        mentions: m
+                            .get("mentions")
+                            .and_then(Value::as_array)
+                            .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+                            .unwrap_or_default(),
                     }
                 })
                 .collect()
@@ -128,8 +175,9 @@ fn body(m: &Value, has_image: bool) -> String {
         "STICKER" if has_image => String::new(),
         "IMAGE" => "[圖片]".into(),
         "STICKER" => "[貼圖]".into(),
-        "VIDEO" => format!("[影片]{}", size_suffix(m)),
-        "AUDIO" => format!("[語音]{}", size_suffix(m)),
+        "VIDEO" => format!("[影片]{}{}", length(m), size_suffix(m)),
+        // 語音的大小沒什麼意義，長度才是。
+        "AUDIO" => format!("[語音]{}", length(m)),
         "FILE" => {
             let name = s(m, "fileName");
             format!("[檔案] {}{}", if name.is_empty() { "未命名" } else { &name }, size_suffix(m))
@@ -137,6 +185,14 @@ fn body(m: &Value, has_image: bool) -> String {
         "CHATEVENT" => "[聊天室事件]".into(),
         _ if !alt.is_empty() => alt,
         _ => format!("[{kind}]"),
+    }
+}
+
+/// 影片／語音長度，例如 " 0:12"。沒有就是空字串。
+fn length(m: &Value) -> String {
+    match n(m, "duration") / 1000 {
+        s if s <= 0 => String::new(),
+        s => format!(" {}:{:02}", s / 60, s % 60),
     }
 }
 
@@ -197,10 +253,24 @@ mod tests {
         assert_eq!(f.text, "[檔案] 報價.pdf（340 KB）");
         assert!(f.openable());
         assert_eq!(one(json!({"contentType":"VIDEO","hasMedia":true,"fileSize":3145728})).text, "[影片]（3.0 MB）");
+        assert_eq!(one(json!({"contentType":"VIDEO","hasMedia":true,"fileSize":3145728,"duration":25000})).text, "[影片] 0:25（3.0 MB）");
+        assert_eq!(one(json!({"contentType":"AUDIO","hasMedia":true,"fileSize":9000,"duration":72500})).text, "[語音] 1:12");
         assert_eq!(one(json!({"contentType":"CALL","text":"Call History : 109000 millisecs, Result: "})).text, "[通話] 1:49");
         assert_eq!(one(json!({"contentType":"CALL","text":"Call History : 0 millisecs, Result: 77"})).text, "[通話] 未接通");
         assert_eq!(one(json!({"contentType":"RICH","altText":"優惠"})).text, "優惠");
         assert_eq!(one(json!({"contentType":"LOCATION"})).text, "[LOCATION]");
+    }
+
+    #[test]
+    fn reactions_and_reads() {
+        let m = one(json!({"contentType":"NONE","text":"x","from":"uME","readCount":3,
+            "reactions":[{"from":"u1","type":"NICE"},{"from":"u2","type":"LOVE"},{"from":"u3","type":"NICE"},{"from":"u4"}],
+            "mentions":["uME","all"]}));
+        assert_eq!(m.read_count, 3);
+        assert_eq!(reaction_summary(&m.reactions), "👍 2  ❤️  ✨");
+        assert_eq!(m.mentions, ["uME", "all"]);
+        assert_eq!(reaction_summary(&[]), "");
+        assert_eq!(reaction_summary(&["UNDO".into()]), ""); // 收回的回應不算
     }
 
     #[test]

@@ -7,6 +7,7 @@
 //! 網路請求都丟到背景執行緒，UI 執行緒不阻塞 —— daemon 抓歷史要跟 LINE
 //! 來回一趟，同步做會整個卡住。
 
+mod archive;
 mod client;
 mod model;
 
@@ -42,8 +43,14 @@ enum Update {
     Older(Vec<Msg>),
     /// daemon 推來的新訊息（chat mid、訊息本身）。
     Incoming(String, Msg),
+    /// 其他推送：已讀、收回、表情、編輯、在手機上讀了（事件名稱, 資料）。
+    Event(String, Value),
+    /// 群組成員載入好了（聊天室, [(mid, 名稱)]）。
+    Members(String, Vec<(String, String)>),
     /// 原檔下載好了，交給系統開。
     Downloaded(String),
+    /// 語音下載好了，播放。
+    Play(String),
     /// 推送連線接上／斷了。
     Online(bool),
     /// 清單游標所在聊天室的預覽（mid、訊息）。
@@ -54,6 +61,13 @@ enum Update {
     AllChats(Vec<Chat>),
     Sent,
     Error(String),
+}
+
+/// Ctrl-S：搜尋訊息存檔。
+struct MsgSearch {
+    query: String,
+    pick: usize,
+    all: Vec<archive::Hit>,
 }
 
 #[derive(Default)]
@@ -120,6 +134,22 @@ struct App {
     open_name: String,
     /// `/` 搜尋。None 是沒在搜。
     search: Option<Search>,
+    msg_search: Option<MsgSearch>,
+    /// 開著的聊天室有已讀／表情／編輯的推送：過一下再重讀（一次把一陣子的變化收齊，
+    /// 不要大群組裡每有人讀一次就打一次 LINE）。
+    reload_at: Option<Instant>,
+    /// 選取訊息後按 d 的第一下：記住是哪則，再按一次才真的收回。
+    unsend_armed: Option<String>,
+    /// 選取訊息後按 r：表情選單。
+    react_picker: bool,
+    /// 打 @ 之後的成員選單。
+    mention: Option<Search>,
+    /// 群組成員（打 @ 用），依聊天室快取。
+    members: HashMap<String, Vec<(String, String)>>,
+    /// 這次要送的訊息裡挑過的 @（mid, 名稱）。送出時才換算位置。
+    pending_mentions: Vec<(String, String)>,
+    /// 正在播的語音（mpv）。再按一次同一則就停。
+    player: Option<std::process::Child>,
     /// 搜尋的範圍：全部聊天室。第一次按 `/` 才跟 daemon 要，之後留著用。
     all_chats: Vec<Chat>,
     /// 按鍵說明開著。
@@ -257,6 +287,42 @@ impl App {
     ///
     /// 兩種情況：沒開聊天室（訊息直接放進 msgs），或開著聊天室但在預覽別的（peeking ——
     /// msgs 是開著那個的，不能動，畫面直接讀 peek_cache）。
+    /// 已讀、收回、表情、編輯、在手機上讀了。
+    fn on_event(&mut self, kind: &str, data: &Value) {
+        let field = |k: &str| data.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+        let chat = field("chat");
+        // 預覽快取是那個聊天室舊的樣子了。
+        self.peek_cache.remove(&chat);
+        if self.preview.as_deref() == Some(chat.as_str()) && self.open.is_none() {
+            self.preview = None; // 清單預覽中的那個：重抓
+        }
+        let is_open = self.open.as_deref() == Some(chat.as_str());
+        match kind {
+            "chat-read" => {
+                if let Some(c) = self.chats.iter_mut().find(|c| c.mid == chat) {
+                    c.unread = 0;
+                }
+            }
+            // 收回：馬上在畫面上換掉，不等重讀 —— 收回常常是「送錯了」，越快消失越好。
+            "unsend" => {
+                let id = field("messageId");
+                if let Some(m) = self.msgs.iter_mut().find(|m| m.id == id) {
+                    m.text = "[已收回]".into();
+                    m.kind = "UNSENT".into();
+                    m.media_path = None;
+                    m.has_media = false;
+                    m.link = None;
+                    m.reactions.clear();
+                }
+            }
+            // 已讀、表情、編輯：開著的那個過一下重讀，一次收齊。
+            _ if is_open => {
+                self.reload_at.get_or_insert_with(|| Instant::now() + Duration::from_millis(1500));
+            }
+            _ => {}
+        }
+    }
+
     fn update_preview(&mut self) {
         if self.narrow {
             return; // 單欄時右邊根本不顯示
@@ -360,6 +426,11 @@ impl App {
         self.cursor = None;
         // 附件是掛給「剛才那個聊天室」的。帶到下一個聊天室，一個 Enter 就送錯人。
         self.attach = None;
+        self.pending_mentions.clear();
+        self.mention = None;
+        self.unsend_armed = None;
+        self.react_picker = false;
+        self.reload_at = None;
         self.scroll = 0;
         self.busy = true;
         self.status = format!("載入 {name}…");
@@ -384,6 +455,23 @@ impl App {
             Ok(v) => Update::AllChats(model::parse_chats(&v)),
             Err(e) => Update::Error(e),
         });
+    }
+
+    /// Ctrl-S：開訊息搜尋。存檔整份讀進來；聊天室名稱要用完整清單才查得到，順便跟 daemon 要。
+    fn start_msg_search(&mut self) {
+        let all = archive::load(&client::state_dir().join("archive.jsonl"));
+        self.msg_search = Some(MsgSearch { query: String::new(), pick: 0, all });
+        if self.all_chats.is_empty() {
+            self.spawn(|| match client::chats(5000) {
+                Ok(v) => Update::AllChats(model::parse_chats(&v)),
+                Err(e) => Update::Error(e),
+            });
+        }
+    }
+
+    /// 聊天室名稱。存檔裡只有 mid；一對一的找不到時用發話者名字（就是對方）。
+    fn chat_name(&self, mid: &str) -> Option<String> {
+        self.chats.iter().chain(self.all_chats.iter()).find(|c| c.mid == mid).map(|c| c.name.clone())
     }
 
     /// 搜尋結果：名稱包含關鍵字（不分大小寫），維持「最近有動靜的在前」。
@@ -440,7 +528,8 @@ impl App {
     /// Tab／Shift-Tab：在可開啟的訊息之間移動。從最新的開始往舊的走，走到頭就取消選取。
     fn move_cursor(&mut self, older: bool) {
         let len = self.msgs.len();
-        let ok = |i: &usize| self.msgs[*i].openable();
+        // 每一則都能選：可以開的（↗）Enter 開，任何一則都能回表情，自己的能收回。
+        let ok = |i: &usize| self.msgs[*i].kind != "UNSENT";
         self.cursor = if older {
             (0..self.cursor.unwrap_or(len)).rev().find(ok)
         } else {
@@ -457,6 +546,16 @@ impl App {
     /// 開啟一則訊息：有原檔的下載後交給系統，否則開它的連結。
     fn open_msg(&mut self, i: usize) {
         let Some(m) = self.msgs.get(i) else { return };
+        let audio = m.kind == "AUDIO";
+        // 語音正在播：這一下是「停」。
+        if audio && self.player.as_mut().is_some_and(|p| matches!(p.try_wait(), Ok(None))) {
+            if let Some(mut p) = self.player.take() {
+                let _ = p.kill();
+                let _ = p.wait();
+            }
+            self.status = "已停止".into();
+            return;
+        }
         if m.has_media {
             let id = m.id.clone();
             self.status = "下載中…".into();
@@ -464,12 +563,102 @@ impl App {
                 match client::download(&id)
                     .and_then(|v| v.get("path").and_then(Value::as_str).map(str::to_string).ok_or("daemon 沒回路徑".into()))
                 {
+                    Ok(path) if audio => Update::Play(path),
                     Ok(path) => Update::Downloaded(path),
                     Err(e) => Update::Error(e),
                 }
             });
         } else if let Some(url) = m.link.clone() {
             self.status = system_open(&url);
+        }
+    }
+
+    /// 選中的那則：r 表情、d 收回。
+    fn react_selected(&mut self, kind: &'static str) {
+        let Some(m) = self.cursor.and_then(|i| self.msgs.get(i)) else { return };
+        let id = m.id.clone();
+        self.react_picker = false;
+        self.status = "送出表情…".into();
+        self.spawn(move || match client::react(&id, kind) {
+            Ok(_) => Update::Error(String::new()), // 成功不用說什麼；畫面靠推送回來的事件重讀
+            Err(e) => Update::Error(format!("表情送不出去：{e}")),
+        });
+    }
+
+    fn unsend_selected(&mut self) {
+        let Some(m) = self.cursor.and_then(|i| self.msgs.get(i)) else { return };
+        if !m.mine {
+            self.status = "只能收回自己的訊息".into();
+            return;
+        }
+        let id = m.id.clone();
+        // 收回是送不回來的：第一下只提示，同一則再按一次才送。
+        if self.unsend_armed.as_deref() != Some(id.as_str()) {
+            self.unsend_armed = Some(id);
+            self.status = "再按一次 d 收回這則（LINE 只能收回 24 小時內的）".into();
+            return;
+        }
+        self.unsend_armed = None;
+        self.status = "收回中…".into();
+        self.spawn(move || match client::unsend(&id) {
+            Ok(_) => Update::Error(String::new()),
+            Err(e) => Update::Error(format!("收回失敗：{e}")),
+        });
+    }
+
+    /// 打 @：開成員選單。群組的成員第一次用時才跟 daemon 要。
+    fn start_mention(&mut self) {
+        let Some(chat) = self.open.clone() else { return };
+        self.mention = Some(Search::default());
+        if !self.members.contains_key(&chat) {
+            self.spawn(move || match client::members(&chat) {
+                Ok(v) => Update::Members(
+                    chat,
+                    v.as_array()
+                        .map(|a| {
+                            a.iter()
+                                .map(|m| {
+                                    let s = |k| m.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+                                    (s("mid"), s("name"))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                ),
+                Err(e) => Update::Error(format!("成員載入失敗：{e}")),
+            });
+        }
+    }
+
+    /// 成員選單的候選：名稱包含已經打的字。
+    fn mention_hits(&self) -> Vec<(String, String)> {
+        let (Some(m), Some(chat)) = (&self.mention, &self.open) else { return vec![] };
+        let q = m.query.to_lowercase();
+        self.members
+            .get(chat)
+            .map(|list| list.iter().filter(|(_, n)| n.to_lowercase().contains(&q)).cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// 在背景用 mpv 播語音（不開視窗）。沒有 mpv 就交給系統的預設程式。
+    fn play(&mut self, path: &str) {
+        if let Some(mut p) = self.player.take() {
+            let _ = p.kill();
+            let _ = p.wait();
+        }
+        let spawned = Command::new("mpv")
+            .args(["--no-video", "--really-quiet", "--"])
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        match spawned {
+            Ok(child) => {
+                self.player = Some(child);
+                self.status = "▶ 播放中（再按一次停止）".into();
+            }
+            Err(_) => self.status = system_open(path),
         }
     }
 
@@ -481,12 +670,13 @@ impl App {
             return;
         }
         self.input.clear();
+        let mentions = mention_spans(&text, &std::mem::take(&mut self.pending_mentions));
         self.status = "傳送中…".into();
         // 附件與文字分開送，附件先：LINE 沒有「圖片加說明」這種單一訊息。
         self.spawn(move || {
             let sent = attach
                 .map_or(Ok(()), |path| client::send_file(&mid, &path).map(|_| ()))
-                .and_then(|()| if text.is_empty() { Ok(()) } else { client::send(&mid, &text).map(|_| ()) });
+                .and_then(|()| if text.is_empty() { Ok(()) } else { client::send(&mid, &text, mentions).map(|_| ()) });
             match sent {
                 Ok(()) => Update::Sent,
                 Err(e) => Update::Error(e),
@@ -541,6 +731,9 @@ impl App {
         if let Some(prompt) = self.path_prompt.as_mut() {
             let joined = format!("{}{}", prompt.text, first_line.trim());
             prompt.set(joined);
+        } else if let Some(ms) = self.msg_search.as_mut() {
+            ms.query.push_str(&first_line);
+            ms.pick = 0;
         } else if let Some(search) = self.search.as_mut() {
             search.query.push_str(&first_line);
             search.pick = 0;
@@ -561,6 +754,11 @@ impl App {
                 self.status.clear();
             }
             Update::Downloaded(path) => self.status = system_open(&path),
+            Update::Members(chat, list) => {
+                self.members.insert(chat, list);
+            }
+            Update::Event(kind, data) => self.on_event(&kind, &data),
+            Update::Play(path) => self.play(&path),
             Update::Online(up) => {
                 self.online = up;
                 // 重新接上的可能是剛重啟、還沒登入的 daemon —— 馬上問一次。
@@ -664,6 +862,21 @@ impl App {
 }
 
 /// 依字元數截斷（不是 byte）—— 中文一個字算一個，切在 byte 邊界會 panic。
+/// 送出時把挑過的 @ 換算成 LINE 要的位置（UTF-16 索引）。挑了卻在送出前刪掉的就不算；
+/// 同一個人提及兩次就各算一次（依序往後找）。
+fn mention_spans(text: &str, picked: &[(String, String)]) -> Value {
+    let mut from = 0;
+    let mut spans = Vec::new();
+    for (mid, name) in picked {
+        let needle = format!("@{name}");
+        let Some(at) = text[from..].find(&needle).map(|i| i + from) else { continue };
+        let start = text[..at].encode_utf16().count();
+        spans.push(serde_json::json!({ "mid": mid, "start": start, "end": start + needle.encode_utf16().count() }));
+        from = at + needle.len();
+    }
+    Value::Array(spans)
+}
+
 /// 剪貼簿裡的東西。
 enum Clip {
     /// 在檔案管理員裡複製的檔案（text/uri-list 的第一個）。
@@ -1292,7 +1505,8 @@ fn draw(f: &mut Frame, app: &mut App) {
             let w = (longest + 1).min(max_w).max(1);
             Size::new(w, wrapped_rows(&m.text, w))
         };
-        let full = u16::from(sep) + gap + u16::from(head) + img.height + text.height;
+        let react = u16::from(!m.reactions.is_empty());
+        let full = u16::from(sep) + gap + u16::from(head) + img.height + text.height + react;
         let room = y.saturating_sub(inner.y);
         if full == 0 || room == 0 {
             break;
@@ -1407,14 +1621,41 @@ fn draw(f: &mut Frame, app: &mut App) {
             }
             cy += s.img.height as i32;
         }
+        // 靠右放在內容第一列的小標籤：自己發的顯示已讀（一對一只說「已讀」，群組帶人數），
+        // 別人的訊息 @ 了我（或 @所有人）就標「@你」。
+        let tag = if m.mine && m.read_count > 0 {
+            let one_to_one = app.open.as_deref().is_some_and(|c| c.starts_with('u'));
+            Some((if one_to_one { "已讀".to_string() } else { format!("已讀 {}", m.read_count) }, dim()))
+        } else if !m.mine && m.mentions.iter().any(|x| *x == app.me || x == "all") {
+            Some(("@你".to_string(), Style::new().fg(accent).add_modifier(Modifier::BOLD)))
+        } else {
+            None
+        };
+        if let (Some((tag, style)), Some(y)) = (tag, whole(cy, 1)) {
+            let w = tag.width() as u16;
+            f.render_widget(
+                Paragraph::new(tag).style(style),
+                put(Rect { x: inner.right().saturating_sub(w + 2), y, width: w, height: 1 }),
+            );
+        }
         if s.text.height > 0 {
             // 上面被切掉的話，從第 cut 列開始畫（Paragraph 的 scroll），顯示的是尾端。
             let cut = (area.y as i32 - cy).max(0) as u16;
             let y = cy.max(area.y as i32) as u16;
+            let body = if m.kind == "UNSENT" { Text::from(Span::styled(m.text.clone(), dim())) } else { rich(&m.text, accent) };
             f.render_widget(
-                Paragraph::new(rich(&m.text, accent)).wrap(Wrap { trim: false }).scroll((cut, 0)),
+                Paragraph::new(body).wrap(Wrap { trim: false }).scroll((cut, 0)),
                 put(Rect { x, y, width: s.text.width, height: s.text.height.saturating_sub(cut) }),
             );
+            cy += s.text.height as i32;
+        }
+        if !m.reactions.is_empty() {
+            if let Some(y) = whole(cy, 1) {
+                f.render_widget(
+                    Paragraph::new(model::reaction_summary(&m.reactions)),
+                    put(Rect { x, y, width: inner.right().saturating_sub(x), height: 1 }),
+                );
+            }
         }
     }
 
@@ -1492,7 +1733,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     } else if peeking.is_some() {
         ("預覽", keys(&[("↑↓", "選擇"), ("Enter", "進入"), ("Esc", "回到這個聊天室")]))
     } else if app.cursor.is_some() {
-        ("選取", keys(&[("Enter", "開啟"), ("Tab", "上一個"), ("⇧Tab", "下一個"), ("Esc", "取消")]))
+        ("選取", keys(&[("r", "表情"), ("d", "收回"), ("Enter", "開啟"), ("Tab", "上一個"), ("Esc", "取消")]))
     } else if in_chat {
         if tight {
             // 放不下全部：先給離開這個畫面的鍵，其餘看 F1。
@@ -1553,6 +1794,23 @@ fn draw(f: &mut Frame, app: &mut App) {
     );
 
     draw_overlays(f, app);
+}
+
+/// 搜尋結果的內文：從關鍵字前幾個字開始，截到 max 寬，關鍵字反白。
+fn snippet(text: &str, term: &str, max: usize, accent: Color) -> Vec<Span<'static>> {
+    let lower = text.to_lowercase();
+    // 小寫化可能改變位元組長度（少數字元），對不上就退回不反白、從頭顯示。
+    let at = (!term.is_empty() && lower.len() == text.len()).then(|| lower.find(term)).flatten();
+    let Some(at) = at else { return vec![Span::raw(fit(text, max))] };
+    let lead: String = text[..at].chars().rev().take(8).collect::<Vec<_>>().into_iter().rev().collect();
+    let prefix = if lead.len() < at { format!("…{lead}") } else { lead };
+    let hit = &text[at..at + term.len()];
+    let rest = fit(&text[at + term.len()..], max.saturating_sub(prefix.width() + hit.width()));
+    vec![
+        Span::raw(prefix),
+        Span::styled(hit.to_string(), Style::new().fg(accent).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
+        Span::raw(rest),
+    ]
 }
 
 /// 在 area 正中間切一塊 w×h（放不下就縮到放得下）。
@@ -1622,6 +1880,99 @@ fn draw_overlays(f: &mut Frame, app: &App) {
         }
     }
 
+    if app.react_picker {
+        const PICK: [(&str, &str); 7] = [
+            ("1", "NICE"), ("2", "LOVE"), ("3", "FUN"), ("4", "AMAZING"), ("5", "SAD"), ("6", "OMG"), ("0", "UNDO"),
+        ];
+        let line = Line::from(
+            PICK.iter()
+                .flat_map(|(k, kind)| {
+                    let glyph = if *kind == "UNDO" { "取消回應" } else { model::reaction_glyph(kind) };
+                    [Span::styled(format!(" {k} "), bold.fg(accent)), Span::raw(format!("{glyph}  "))]
+                })
+                .collect::<Vec<_>>(),
+        );
+        let area = centered(f.area(), line.width() as u16 + 4, 3);
+        f.render_widget(Clear, area);
+        f.render_widget(
+            Paragraph::new(line).block(pane(Line::from(Span::styled(" 表情 ", bold)), true, accent)),
+            area,
+        );
+    }
+
+    if app.mention.is_some() {
+        let hits = app.mention_hits();
+        let pick = app.mention.as_ref().map_or(0, |m| m.pick);
+        let query = app.mention.as_ref().map_or(String::new(), |m| m.query.clone());
+        let loaded = app.open.as_ref().is_some_and(|c| app.members.contains_key(c));
+        let area = centered(f.area(), 40, 12);
+        f.render_widget(Clear, area);
+        let block = pane(Line::from(Span::styled(" 提及 ", bold)), true, accent)
+            .title_bottom(Line::from(" Enter 選　Esc 只打 @ ").right_aligned());
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let mut lines = vec![Line::from(vec![Span::styled("@", Style::new().fg(accent)), Span::raw(query)])];
+        if !loaded {
+            lines.push(Line::from(Span::styled(" 載入成員…", dim())));
+        }
+        let rows = inner.height.saturating_sub(1) as usize;
+        let start = (pick + 1).saturating_sub(rows);
+        for (i, (_, name)) in hits.iter().enumerate().skip(start).take(rows) {
+            let picked = i == pick;
+            lines.push(Line::from(vec![
+                Span::styled(if picked { "▌ " } else { "  " }, Style::new().fg(accent)),
+                Span::styled(fit(name, inner.width.saturating_sub(3) as usize), if picked { bold.fg(accent) } else { Style::new() }),
+            ]));
+        }
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
+    if let Some(ms) = &app.msg_search {
+        let hits = archive::find(&ms.all, &ms.query);
+        let area = centered(f.area(), 100, 26);
+        f.render_widget(Clear, area);
+        let block = pane(Line::from(Span::styled(" 搜尋訊息 ", bold)), true, accent).title_bottom(
+            Line::from(format!(" {} 筆 · 存檔共 {} 則 · Enter 開聊天室 · Esc 關閉 ", hits.len(), ms.all.len()))
+                .right_aligned(),
+        );
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        if inner.height >= 2 && inner.width > 10 {
+            f.render_widget(
+                Paragraph::new(Line::from(vec![Span::styled("⌕ ", Style::new().fg(accent)), Span::raw(ms.query.clone())])),
+                Rect { height: 1, ..inner },
+            );
+            let cx = inner.x + 2 + ms.query.width() as u16;
+            f.set_cursor_position((cx.min(inner.right() - 1), inner.y));
+
+            // 一筆兩行：日期、聊天室、發話者；底下是內文，從第一個關鍵字前一點開始，關鍵字反白。
+            let rows = ((inner.height - 1) / 2) as usize;
+            let start = (ms.pick + 1).saturating_sub(rows);
+            let w = inner.width as usize;
+            let first = ms.query.split_whitespace().next().unwrap_or("").to_lowercase();
+            let mut lines: Vec<Line> = Vec::new();
+            for (i, h) in hits.iter().enumerate().skip(start).take(rows) {
+                let picked = i == ms.pick;
+                let bar = Span::styled(if picked { "▌ " } else { "  " }, Style::new().fg(accent));
+                let chat = app.chat_name(&h.chat).unwrap_or_else(|| h.from_name.clone());
+                let who = if h.from_name == chat { String::new() } else { format!(" · {}", h.from_name) };
+                lines.push(Line::from(vec![
+                    bar.clone(),
+                    Span::styled(format!("{} {}  ", model::day_label(h.time), model::clock(h.time)), dim()),
+                    Span::styled(fit(&format!("{chat}{who}"), w.saturating_sub(16)), if picked { bold.fg(accent) } else { bold }),
+                ]));
+                lines.push(Line::from([vec![bar], snippet(&h.text, &first, w.saturating_sub(4), accent)].concat()));
+            }
+            let list = Rect { y: inner.y + 1, height: inner.height - 1, ..inner };
+            let note = if ms.query.trim().is_empty() { "  打字開始搜尋（空白分開的詞都要出現）" } else { "  沒有符合的訊息" };
+            if lines.is_empty() {
+                f.render_widget(Paragraph::new(note).style(dim()), list);
+            } else {
+                f.render_widget(Paragraph::new(lines), list);
+            }
+        }
+    }
+
     if let Some(prompt) = &app.path_prompt {
         let area = centered(f.area(), 72, 14);
         f.render_widget(Clear, area);
@@ -1665,16 +2016,24 @@ fn draw_overlays(f: &mut Frame, app: &App) {
                 ("↑ ↓  j k", "選聊天室"),
                 ("Enter", "開啟聊天室"),
                 ("/", "搜尋全部聊天室"),
+                ("Ctrl-S", "搜尋訊息內容（本機存檔，比兩週更早的也找得到）"),
                 ("r", "重整清單"),
                 ("q", "離開"),
             ]),
             ("對話", &[
                 ("Enter", "送出（輸入框有字時）"),
-                ("Tab  ⇧Tab", "選可開啟的訊息（標 ↗），Enter 開啟"),
+                ("Tab  ⇧Tab", "選訊息（之後 r 表情、d 收回、Enter 開）"),
                 ("PgUp PgDn", "捲動訊息"),
                 ("g", "載入更舊的訊息（輸入框空的時候）"),
                 ("/", "搜尋全部聊天室（輸入框空的時候）"),
                 ("Esc", "取消選取；再按一次回清單"),
+            ]),
+            ("訊息", &[
+                ("Tab ⇧Tab", "選一則訊息，選中後："),
+                ("  r", "表情回應（1–6 選，0 取消回應）"),
+                ("  d", "收回自己的訊息（按兩次）"),
+                ("  Enter", "開附件或連結（標 ↗ 的）"),
+                ("@", "群組裡打 @ 挑人提及"),
             ]),
             ("附件", &[
                 ("Ctrl-V", "貼上：圖片或複製的檔案變附件"),
@@ -1925,6 +2284,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         vip: load_vip(),
         open_name: String::new(),
         search: None,
+        msg_search: None,
+        player: None,
+        reload_at: None,
+        unsend_armed: None,
+        react_picker: false,
+        mention: None,
+        members: HashMap::new(),
+        pending_mentions: Vec::new(),
         all_chats: vec![],
         help: false,
         attach: None,
@@ -1950,7 +2317,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 || {
                     let _ = tx.send(Update::Online(true));
                 },
-                |data| {
+                |event, data| {
+                    if event != "message" {
+                        let _ = tx.send(Update::Event(event.to_string(), data));
+                        return;
+                    }
                     let chat = data.get("chat").and_then(Value::as_str).unwrap_or("").to_string();
                     if let Some(msg) = model::parse_msgs(&Value::Array(vec![data]), &me).pop() {
                         let _ = tx.send(Update::Incoming(chat, msg));
@@ -1994,6 +2365,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         app.update_preview();
+        // 已讀／表情／編輯的推送：到時間重讀開著的聊天室。往上捲著的時候不重讀（會把載入的
+        // 舊訊息丟掉），等捲回底部的下一個事件。
+        if app.reload_at.is_some_and(|t| Instant::now() >= t) {
+            app.reload_at = None;
+            if app.scroll == 0 && app.cursor.is_none() {
+                app.reload_open();
+            }
+        }
+        // 播完的 mpv 收屍，不然留著殭屍行程，下次按也會誤判成「正在播」。
+        if app.player.as_mut().is_some_and(|p| !matches!(p.try_wait(), Ok(None))) {
+            app.player = None;
+        }
         if last_session.elapsed() > Duration::from_secs(10) {
             last_session = Instant::now();
             app.check_session();
@@ -2025,7 +2408,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         // 浮層開著時滑鼠不作用，免得點穿到底下的清單。
-        if matches!(ev, Event::Mouse(_)) && (app.help || app.search.is_some() || app.path_prompt.is_some()) {
+        if matches!(ev, Event::Mouse(_)) && (app.help || app.search.is_some() || app.msg_search.is_some() || app.path_prompt.is_some() || app.react_picker || app.mention.is_some()) {
             continue;
         }
         if let Event::Mouse(m) = ev {
@@ -2096,6 +2479,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if key.kind != KeyEventKind::Press {
             continue;
         }
+        if key.code != KeyCode::Char('d') {
+            app.unsend_armed = None;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             break Ok(());
         }
@@ -2114,6 +2500,83 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if key.code == KeyCode::F(1) {
             app.help = true;
+            continue;
+        }
+        // 表情選單：數字選，其他鍵取消。
+        if app.react_picker {
+            match key.code {
+                KeyCode::Char('1') => app.react_selected("NICE"),
+                KeyCode::Char('2') => app.react_selected("LOVE"),
+                KeyCode::Char('3') => app.react_selected("FUN"),
+                KeyCode::Char('4') => app.react_selected("AMAZING"),
+                KeyCode::Char('5') => app.react_selected("SAD"),
+                KeyCode::Char('6') => app.react_selected("OMG"),
+                KeyCode::Char('0') => app.react_selected("UNDO"),
+                _ => app.react_picker = false,
+            }
+            continue;
+        }
+        // @ 選單：打字篩、↑↓ 選、Enter 放進輸入框、Esc 就只留一個 @。
+        if app.mention.is_some() {
+            let hits = app.mention_hits();
+            let Some(m) = app.mention.as_mut() else { continue };
+            match key.code {
+                KeyCode::Esc => app.mention = None,
+                KeyCode::Up => m.pick = m.pick.saturating_sub(1),
+                KeyCode::Down if m.pick + 1 < hits.len() => m.pick += 1,
+                KeyCode::Backspace if m.query.is_empty() => {
+                    app.mention = None;
+                    app.input.pop(); // 連那個 @ 一起刪
+                }
+                KeyCode::Backspace => {
+                    m.query.pop();
+                    m.pick = 0;
+                }
+                KeyCode::Char(c) => {
+                    m.query.push(c);
+                    m.pick = 0;
+                }
+                KeyCode::Enter => {
+                    if let Some((mid, name)) = hits.get(m.pick).cloned() {
+                        app.input.push_str(&format!("{name} ")); // 輸入框裡已經有那個 @
+                        app.pending_mentions.push((mid, name));
+                    }
+                    app.mention = None;
+                }
+                _ => {}
+            }
+            continue;
+        }
+        // 訊息搜尋開著時，按鍵全部歸它。
+        if app.msg_search.is_some() {
+            let Some(ms) = app.msg_search.as_mut() else { continue };
+            let hits: Vec<(String, String)> =
+                archive::find(&ms.all, &ms.query).iter().map(|h| (h.chat.clone(), h.from_name.clone())).collect();
+            match key.code {
+                KeyCode::Esc => app.msg_search = None,
+                KeyCode::Up => ms.pick = ms.pick.saturating_sub(1),
+                KeyCode::Down if ms.pick + 1 < hits.len() => ms.pick += 1,
+                KeyCode::Backspace => {
+                    ms.query.pop();
+                    ms.pick = 0;
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    ms.query.push(c);
+                    ms.pick = 0;
+                }
+                KeyCode::Enter => {
+                    if let Some((mid, from)) = hits.get(ms.pick).cloned() {
+                        app.msg_search = None;
+                        let name = app.chat_name(&mid).unwrap_or(from);
+                        app.open_chat(mid, name);
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+            app.start_msg_search();
             continue;
         }
         // 搜尋開著時，按鍵全部歸它。
@@ -2260,6 +2723,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 app.preview = None; // 回清單後重新預覽（剛才讀過，內容可能變了）
                 app.check_session();
             }
+            // 選中一則訊息、輸入框是空的：r 表情、d 收回。
+            KeyCode::Char('r') if app.cursor.is_some() && app.input.is_empty() => app.react_picker = true,
+            KeyCode::Char('d') if app.cursor.is_some() && app.input.is_empty() => app.unsend_selected(),
+            // 群組裡打 @：挑人。一對一沒有要提及的對象。
+            KeyCode::Char('@')
+                if app.open.as_deref().is_some_and(|c| !c.starts_with('u')) =>
+            {
+                app.input.push('@');
+                app.start_mention();
+            }
             KeyCode::Char(c) => {
                 // 清單模式：字母一律是快捷鍵。輸入框屬於聊天室，沒開聊天室時它不存在 ——
                 // 以前這裡還要求輸入框是空的，於是只要有字殘留在輸入框（離開聊天室沒清），
@@ -2290,6 +2763,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    if let Some(mut p) = app.player.take() {
+        let _ = p.kill(); // 關掉 TUI 時語音也停
+    }
     restore_terminal()?;
     res
 }
@@ -2354,6 +2830,16 @@ mod tests {
         // 沒有符合的：輸入不動。
         assert_eq!(complete_path(&format!("{base}zzz")).0, format!("{base}zzz"));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn mention_positions_are_utf16() {
+        let picked = vec![("u1".to_string(), "小安".to_string()), ("u2".to_string(), "Bob".to_string())];
+        // 😀 在 UTF-16 是兩個單位：位置要照那樣算，不是位元組也不是字元數。
+        let spans = mention_spans("😀 @小安 跟 @Bob 好", &picked);
+        assert_eq!(spans, serde_json::json!([{"mid":"u1","start":3,"end":6},{"mid":"u2","start":9,"end":13}]));
+        // 挑了又刪掉的不算。
+        assert_eq!(mention_spans("沒有提及", &picked), serde_json::json!([]));
     }
 
     #[test]
