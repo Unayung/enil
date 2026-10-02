@@ -128,6 +128,9 @@ struct App {
     attach: Option<String>,
     /// Ctrl-F 的路徑輸入框。None 是沒開。
     path_prompt: Option<PathPrompt>,
+    /// 開著聊天室時，使用者用 ↑↓／滾輪動了左邊清單。這時右邊預覽清單上選中的那個
+    /// （見 peeking）；Enter 進去、Esc 回到開著的那個。
+    peek: bool,
     /// 各聊天室打到一半的字。離開聊天室時收起來，回來時放回輸入框。只在記憶體裡。
     drafts: HashMap<String, String>,
     /// 預覽抓過的訊息，依聊天室。同一個聊天室回頭再看就不再問 LINE。
@@ -212,11 +215,28 @@ impl App {
         }
     }
 
-    /// Ctrl-P：把開著的聊天室（沒開就是清單上選中的那個）設成 VIP，或取消。
+    /// 開著聊天室，但右邊正在預覽清單上選中的另一個。輸入框這時不收字：
+    /// 它屬於開著的那個，畫面上卻是別人 —— 一個 Enter 就送錯人。
+    fn peeking(&self) -> Option<&Chat> {
+        let open = self.open.as_ref()?;
+        let chat = self.chats.get(self.selected)?;
+        (self.peek && !self.narrow && &chat.mid != open).then_some(chat)
+    }
+
+    /// Esc：不預覽了，回到開著的那個；清單游標也移回它。
+    fn end_peek(&mut self) {
+        self.peek = false;
+        if let Some(i) = self.open.as_ref().and_then(|mid| self.chats.iter().position(|c| &c.mid == mid)) {
+            self.selected = i;
+        }
+    }
+
+    /// Ctrl-P：把畫面上的那個聊天室（開著的，或正在預覽的）設成 VIP，或取消。
     fn toggle_vip(&mut self) {
-        let target = match &self.open {
-            Some(mid) => Some((mid.clone(), self.open_name.clone())),
-            None => self.chats.get(self.selected).map(|c| (c.mid.clone(), c.name.clone())),
+        let target = match (self.peeking(), &self.open) {
+            (Some(c), _) => Some((c.mid.clone(), c.name.clone())),
+            (None, Some(mid)) => Some((mid.clone(), self.open_name.clone())),
+            (None, None) => self.chats.get(self.selected).map(|c| (c.mid.clone(), c.name.clone())),
         };
         let Some((mid, name)) = target else { return };
         self.status = if self.vip.remove(&mid) {
@@ -233,10 +253,34 @@ impl App {
         self.pin_vips();
     }
 
-    /// 主迴圈每一輪呼叫：沒開聊天室時，游標停在一個還沒預覽的聊天室上就抓它的訊息。
+    /// 主迴圈每一輪呼叫：游標停在一個還沒預覽的聊天室上就抓它的訊息。
+    ///
+    /// 兩種情況：沒開聊天室（訊息直接放進 msgs），或開著聊天室但在預覽別的（peeking ——
+    /// msgs 是開著那個的，不能動，畫面直接讀 peek_cache）。
     fn update_preview(&mut self) {
-        if self.open.is_some() || self.narrow {
-            return; // 開著聊天室時右邊是那個聊天室；單欄時右邊根本不顯示
+        if self.narrow {
+            return; // 單欄時右邊根本不顯示
+        }
+        if self.open.is_some() {
+            let Some(mid) = self.peeking().map(|c| c.mid.clone()) else { return };
+            if self.peek_cache.contains_key(&mid) || self.preview.as_deref() == Some(mid.as_str()) {
+                return; // 已經有了，或正在抓
+            }
+            if self.preview_seen.as_deref() != Some(mid.as_str()) {
+                self.preview_seen = Some(mid);
+                self.preview_moved = Instant::now();
+                return;
+            }
+            if self.preview_moved.elapsed() < Duration::from_millis(200) {
+                return;
+            }
+            self.preview = Some(mid.clone());
+            let me = self.me.clone();
+            self.spawn(move || match client::peek(&mid, 30) {
+                Ok(v) => Update::Preview(mid, model::parse_msgs(&v, &me)),
+                Err(e) => Update::Error(e),
+            });
+            return;
         }
         let Some(mid) = self.chats.get(self.selected).map(|c| c.mid.clone()) else { return };
         if self.preview.as_deref() == Some(mid.as_str()) {
@@ -269,6 +313,20 @@ impl App {
         });
     }
 
+    /// 別的程式要求打開某個聊天室（VIP 彈窗的「前往回覆」）：state 目錄裡的 open-request，
+    /// 內容是「mid<Tab>名稱」。讀到就刪，免得下次啟動又開一次。
+    fn take_open_request(&mut self) {
+        let path = client::state_dir().join("open-request");
+        let Ok(raw) = std::fs::read_to_string(&path) else { return };
+        let _ = std::fs::remove_file(&path);
+        let (mid, name) = raw.trim().split_once('\t').unwrap_or((raw.trim(), ""));
+        if mid.is_empty() {
+            return;
+        }
+        let name = self.chats.iter().find(|c| c.mid == mid).map_or(name.to_string(), |c| c.name.clone());
+        self.open_chat(mid.to_string(), name);
+    }
+
     fn open_selected(&mut self) {
         if let Some(chat) = self.chats.get(self.selected) {
             self.open_chat(chat.mid.clone(), chat.name.clone());
@@ -289,6 +347,12 @@ impl App {
 
     fn open_chat(&mut self, mid: String, name: String) {
         self.stash_draft();
+        self.peek = false;
+        self.preview = None;
+        // 清單游標跟著開的那個走（從搜尋開的也是），不然下一個 ↑↓ 會從奇怪的地方開始。
+        if let Some(i) = self.chats.iter().position(|c| c.mid == mid) {
+            self.selected = i;
+        }
         self.input = self.drafts.remove(&mid).unwrap_or_default();
         let me = self.me.clone();
         self.open = Some(mid.clone());
@@ -566,7 +630,7 @@ impl App {
                 }
                 // VIP 的提醒是 daemon 發的（不會自己消失的系統通知），這裡再發就重複了。
                 self.peek_cache.remove(&chat);
-                if self.open.is_none() && self.preview.as_deref() == Some(chat.as_str()) {
+                if self.preview.as_deref() == Some(chat.as_str()) {
                     self.preview = None; // 下一輪 update_preview 會重抓
                 }
                 if should_notify(&msg, is_open, self.focused) && !self.vip.contains(&chat) {
@@ -1113,9 +1177,24 @@ fn draw(f: &mut Frame, app: &mut App) {
     }
 
     // ---------------------------------------------------------------- 訊息
-    let title = app.open.as_ref().map(|_| app.open_name.clone());
-    let preview_name = match (&app.open, &app.preview) {
-        (None, Some(mid)) => app.chats.iter().find(|c| &c.mid == mid).map(|c| c.name.clone()),
+    // 開著聊天室但在預覽別的：這一段畫的是被預覽的那個。msgs／scroll／cursor 是開著那個的，
+    // 先換出來，畫完換回去（下面整段都讀 app.msgs，這樣不必每處都分兩種情況）。
+    let peeking = app.peeking().map(|c| (c.mid.clone(), c.name.clone()));
+    let saved = peeking.as_ref().map(|(mid, _)| {
+        let shown = app.peek_cache.get(mid).cloned().unwrap_or_default();
+        (std::mem::replace(&mut app.msgs, shown), app.scroll, app.cursor.take(), app.busy)
+    });
+    if saved.is_some() {
+        app.scroll = 0;
+        app.busy = app.msgs.is_empty(); // 還沒抓到就是「載入中」
+    }
+    let title = match &peeking {
+        Some(_) => None,
+        None => app.open.as_ref().map(|_| app.open_name.clone()),
+    };
+    let preview_name = match (&peeking, &app.open, &app.preview) {
+        (Some((_, name)), _, _) => Some(name.clone()),
+        (None, None, Some(mid)) => app.chats.iter().find(|c| &c.mid == mid).map(|c| c.name.clone()),
         _ => None,
     };
     let mut msg_block = pane(
@@ -1339,6 +1418,16 @@ fn draw(f: &mut Frame, app: &mut App) {
         }
     }
 
+    if let Some((msgs, scroll, cursor, busy)) = saved {
+        app.msgs = msgs;
+        app.scroll = scroll;
+        app.cursor = cursor;
+        app.busy = busy;
+        app.msg_rects.clear(); // 點擊對應的是開著那個的索引，預覽中的不能點
+    }
+    // 輸入框與狀態列用的是開著的那個。
+    let title = app.open.as_ref().map(|_| app.open_name.clone());
+
     // ---------------------------------------------------------------- 輸入列
     let input_block = pane(Line::default(), in_chat, accent);
     let input_inner = input_block.inner(right[1]);
@@ -1365,6 +1454,14 @@ fn draw(f: &mut Frame, app: &mut App) {
         used += w;
     }
     let body = match (in_chat, app.input.is_empty()) {
+        _ if peeking.is_some() => Span::styled(
+            format!(
+                "Enter 進入 {}　Esc 回到 {}",
+                fit(&peeking.as_ref().unwrap().1, 20),
+                fit(title.as_deref().unwrap_or(""), 20)
+            ),
+            dim(),
+        ),
         (false, _) => Span::styled("先選一個聊天室", dim()),
         (true, true) if chip.is_some() => Span::styled("Enter 送出　Esc 取消附件", dim()),
         (true, true) => Span::styled(
@@ -1382,7 +1479,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     input_line.push(body);
     f.render_widget(Paragraph::new(Line::from(input_line)), input_inner);
     // 游標放在輸入位置：輸入法（fcitx5）的候選字視窗是跟著游標走的。
-    if in_chat && input_inner.width > 2 {
+    if in_chat && peeking.is_none() && input_inner.width > 2 {
         f.set_cursor_position((input_inner.x + 2 + (chip_w + used) as u16, input_inner.y));
     }
 
@@ -1392,6 +1489,8 @@ fn draw(f: &mut Frame, app: &mut App) {
         ("附檔", keys(&[("Tab", "補完"), ("Enter", "附加"), ("Esc", "取消")]))
     } else if app.search.is_some() {
         ("搜尋", keys(&[("↑↓", "選擇"), ("Enter", "開啟"), ("Esc", "取消")]))
+    } else if peeking.is_some() {
+        ("預覽", keys(&[("↑↓", "選擇"), ("Enter", "進入"), ("Esc", "回到這個聊天室")]))
     } else if app.cursor.is_some() {
         ("選取", keys(&[("Enter", "開啟"), ("Tab", "上一個"), ("⇧Tab", "下一個"), ("Esc", "取消")]))
     } else if in_chat {
@@ -1818,6 +1917,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         narrow: false,
         peek_cache: HashMap::new(),
         drafts: HashMap::new(),
+        peek: false,
         preview: None,
         preview_seen: None,
         preview_moved: Instant::now(),
@@ -1877,6 +1977,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if last_theme.elapsed() > Duration::from_secs(1) {
             last_theme = Instant::now();
             app.theme.refresh();
+            app.take_open_request();
         }
 
         // daemon 沒登入：切到登入畫面，登入完回來把清單與開著的聊天室重讀一次。
@@ -1978,12 +2079,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 MouseEventKind::ScrollDown if in_msgs => app.scroll = app.scroll.saturating_sub(3),
                 MouseEventKind::ScrollUp if in_list => {
-                    app.selected = app.selected.saturating_sub(1)
+                    app.selected = app.selected.saturating_sub(1);
+                    app.peek = app.open.is_some();
                 }
                 MouseEventKind::ScrollDown if in_list => {
                     if app.selected + 1 < app.chats.len() {
                         app.selected += 1;
                     }
+                    app.peek = app.open.is_some();
                 }
                 _ => {}
             }
@@ -2081,6 +2184,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             app.toggle_vip();
             continue;
         }
+        // 預覽別的聊天室時：只認移動、進入、回去。打字、貼上、附檔、送出都屬於開著的那個，
+        // 這時畫面上卻是別人，一律不收。
+        if app.peeking().is_some() {
+            match key.code {
+                KeyCode::Enter => app.open_selected(),
+                KeyCode::Esc => app.end_peek(),
+                KeyCode::Up => app.selected = app.selected.saturating_sub(1),
+                KeyCode::Down if app.selected + 1 < app.chats.len() => app.selected += 1,
+                KeyCode::Char(_) => app.status = "預覽中：Enter 進入，Esc 回到原本的聊天室".into(),
+                _ => {}
+            }
+            continue;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && app.open.is_some() {
             match key.code {
                 KeyCode::Char('v') => {
@@ -2115,11 +2231,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             KeyCode::Backspace => {
                 app.input.pop();
             }
-            KeyCode::Up => app.selected = app.selected.saturating_sub(1),
+            KeyCode::Up => {
+                app.selected = app.selected.saturating_sub(1);
+                app.peek = app.open.is_some();
+            }
             KeyCode::Down => {
                 if app.selected + 1 < app.chats.len() {
                     app.selected += 1;
                 }
+                app.peek = app.open.is_some();
             }
             KeyCode::PageUp => {
                 app.scroll = app.scroll.saturating_add(10);
