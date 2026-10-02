@@ -301,6 +301,50 @@ function onIncoming(m: Msg, caughtUp = false) {
   push("message", m);
 }
 
+// ------------------------------------------------------------------ 事件統計
+//
+// 觀察用：LINE 實際推了哪些 Operation 類型給這台次要裝置、各幾次。起因是想知道
+// 「對方正在輸入」（NOTIFIED_TYPING）伺服器到底會不會送 —— 官方 App 不顯示這個，協定裡卻有。
+// 累計寫進 state 目錄的 op-stats.json（跨重啟累加），第一次見到的類型另外記一行 log。
+// 看結果：jq . ~/.local/state/enil/op-stats.json；journalctl --user -u enil | grep 事件類型
+
+const OP_STATS_FILE = join(STATE_DIR, "op-stats.json");
+const OP_STATS_FLUSH_MS = 10 * 60_000;
+let opCounts: Record<string, number> = {};
+let opFirstSeen: Record<string, string> = {};
+try {
+  const saved = JSON.parse(readFileSync(OP_STATS_FILE, "utf8"));
+  opCounts = saved.counts ?? {};
+  opFirstSeen = saved.firstSeen ?? {};
+} catch { /* 第一次跑 */ }
+let opDirty = false;
+
+function tallyOp(type: string, op: any) {
+  if (!(type in opCounts)) {
+    opFirstSeen[type] = new Date().toISOString();
+    console.log(`新的事件類型：${type}`);
+  }
+  opCounts[type] = (opCounts[type] ?? 0) + 1;
+  opDirty = true;
+  // 要找的就是這個：出現就馬上記，連同聊天室（只記 mid 前幾碼，不記內容）。
+  if (type === "NOTIFIED_TYPING") {
+    console.log(`事件類型 NOTIFIED_TYPING：param1=${String(op?.param1 ?? "").slice(0, 6)}… param2=${String(op?.param2 ?? "").slice(0, 6)}…`);
+  }
+}
+
+function flushOpStats() {
+  if (!opDirty) return;
+  opDirty = false;
+  try {
+    const tmp = `${OP_STATS_FILE}.tmp`;
+    writeFileSync(tmp, JSON.stringify({ updatedAt: new Date().toISOString(), counts: opCounts, firstSeen: opFirstSeen }, null, 2));
+    renameSync(tmp, OP_STATS_FILE);
+  } catch (err) {
+    console.warn("事件統計存不了：", (err as Error)?.message ?? err);
+  }
+}
+setInterval(flushOpStats, OP_STATS_FLUSH_MS);
+
 /** 推一個事件給所有訂閱者：一行 { event, data }。 */
 function push(event: string, data: unknown) {
   const line_ = JSON.stringify({ event, data }) + "\n";
@@ -433,7 +477,7 @@ async function catchUp(chats: Chat[]) {
 /** 推送救不回來：結束 process，讓 systemd（Restart=on-failure）重開、用快取憑證重新登入。 */
 function restart(reason: string) {
   console.error(`推送失效（${reason}），5 秒後重啟 daemon`);
-  setTimeout(() => process.exit(1), 5_000);
+  setTimeout(() => { flushOpStats(); process.exit(1); }, 5_000);
 }
 
 // 送過 subscribe 的連線。之後每則新訊息都會收到一行 { event: "message", data: Msg }。
@@ -563,6 +607,7 @@ async function startLogin(force: boolean): Promise<void> {
     lastPushAt = Date.now();
     line.onMessage((m) => onIncoming(m));
     line.onEvents(onChatEvent);
+    line.onAnyOp(tallyOp);
     line.onTrouble((kind, detail) => {
       if (kind === "push-dead") return restart(detail);
       // 被踢：憑證已經沒用了，重開也一樣。停在「要重新登入」，等人處理。
@@ -621,6 +666,7 @@ void startLogin(false);
 
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
   process.on(sig, () => {
+    flushOpStats(); // systemd 重啟時別把最後十分鐘的統計丟掉
     server.close();
     clearQr();
     try { unlinkSync(SOCK); } catch { /* 已經沒了 */ }

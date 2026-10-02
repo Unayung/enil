@@ -428,6 +428,15 @@ export class Line {
     return mids.map((mid) => ({ mid, name: this.#names.get(mid) ?? mid.slice(0, 8) }));
   }
 
+  /** 每一個推送來的 Operation 的類型（字串；linejs 不認得的是數字）。觀察用。 */
+  onAnyOp(cb: (type: string, op: any) => void): void {
+    this.#client.on("event", (op: any) => {
+      try {
+        cb(String(op?.type ?? "?"), op);
+      } catch { /* 觀察用的，不能影響其他處理 */ }
+    });
+  }
+
   /**
    * 「不是新訊息」的推送：已讀、收回、表情、編輯。linejs 只把新訊息與編輯包成事件，
    * 其餘要從原始 Operation 自己認（欄位意思照 linejs 的 example/_event/talk-class.ts）。
