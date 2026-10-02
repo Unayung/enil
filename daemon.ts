@@ -13,11 +13,11 @@
 // 必須透過 state 交給 UI 顯示，否則第一次登入根本做不到。
 import { createServer, connect as netConnect, type Socket } from "node:net";
 import qrcode from "qrcode-terminal";
-import { appendFileSync, chmodSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, closeSync, existsSync, mkdirSync, readFileSync, openSync, readdirSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { type Chat, Line, type Msg } from "./line.js";
+import { type Chat, type ChatEvent, Line, type Msg } from "./line.js";
 import { ARCHIVE_FILE, SOCK, STATE_DIR, STATE_FILE } from "./paths.js";
 import { isVip, vipAlertArgs } from "./vip.js";
 
@@ -171,8 +171,26 @@ const handlers: Record<string, (line: Line, req: any) => Promise<unknown>> = {
   },
   async send(line, req) {
     if (!req.chat || !req.text) throw new Error("缺 chat 或 text");
-    await line.send(req.chat, req.text);
+    // mentions：[{ mid, start, end }]，start／end 是 text 的 JS 字串索引（UTF-16）。
+    const mentions = Array.isArray(req.mentions)
+      ? req.mentions.map((x: any) => ({ mid: String(x.mid), start: Number(x.start), end: Number(x.end) }))
+      : undefined;
+    await line.send(req.chat, req.text, mentions);
     return { sent: true };
+  },
+  async unsend(line, req) {
+    if (!req.messageId) throw new Error("缺 messageId");
+    await line.unsend(String(req.messageId));
+    return { unsent: true };
+  },
+  async react(line, req) {
+    if (!req.messageId || !req.type) throw new Error("缺 messageId 或 type");
+    await line.react(String(req.messageId), String(req.type));
+    return { reacted: true };
+  },
+  async members(line, req) {
+    if (!req.chat) throw new Error("缺 chat");
+    return await line.members(String(req.chat));
   },
   async sendFile(line, req) {
     if (!req.chat || !req.path) throw new Error("缺 chat 或 path");
@@ -236,7 +254,16 @@ function archive(m: Msg) {
   }
 }
 
-function onIncoming(m: Msg) {
+/**
+ * 收到一則訊息（推送來的，或對帳時補抓的）。
+ * caughtUp：對帳補抓的。那時聊天室的未讀已經跟伺服器對齊過了，不能再加一次。
+ */
+function onIncoming(m: Msg, caughtUp = false) {
+  if (seen.has(m.id)) return; // 推送與對帳可能交出同一則
+  seen.add(m.id);
+  if (seen.size > SEEN_MAX) seen.delete(seen.values().next().value!);
+  known.set(m.chat, Math.max(known.get(m.chat) ?? 0, m.time));
+  if (!caughtUp) lastPushAt = Date.now();
   archive(m);
   const chat = state.chats.find((c) => c.mid === m.chat);
   const text = previewOf(m);
@@ -245,7 +272,7 @@ function onIncoming(m: Msg) {
     chat.lastFrom = m.fromName;
     chat.lastTime = m.time;
     // ponytail: 未讀在本機累加，每 RESYNC_MS 跟伺服器對齊一次。
-    if (m.from !== state.me?.mid) chat.unread += 1;
+    if (m.from !== state.me?.mid && !caughtUp) chat.unread += 1;
   } else {
     // 沒在清單裡的聊天室（例如剛被加進新群）—— 下次 resync 會補上完整資訊。
     state.chats.unshift({
@@ -257,7 +284,9 @@ function onIncoming(m: Msg) {
   state.chats.sort((a, b) => b.lastTime - a.lastTime);
 
   // VIP：除非使用者正盯著那個聊天室，否則留一筆提醒。要在 writeState 之前，才會跟著寫出去。
-  if (m.from !== state.me?.mid && isVip(m.chat)) {
+  // VIP 的訊息、或有人 @ 我：除非正盯著那個聊天室，否則留一筆提醒（同一個大彈窗）。
+  const mentionsMe = !!state.me && !!m.mentions?.includes(state.me.mid);
+  if (m.from !== state.me?.mid && (isVip(m.chat) || mentionsMe)) {
     const watching = viewing && viewing.chat === m.chat && Date.now() < viewing.until;
     if (!watching) {
       const name = chat?.name ?? m.fromName;
@@ -269,8 +298,37 @@ function onIncoming(m: Msg) {
 
   writeState();
   // 推給訂閱者。OpenChat 不走 onIncoming，所以不會被推送（見 startLogin）。
-  const event = JSON.stringify({ event: "message", data: m }) + "\n";
-  for (const sock of subscribers) sock.write(event);
+  push("message", m);
+}
+
+/** 推一個事件給所有訂閱者：一行 { event, data }。 */
+function push(event: string, data: unknown) {
+  const line_ = JSON.stringify({ event, data }) + "\n";
+  for (const sock of subscribers) sock.write(line_);
+}
+
+/** 已讀、收回、表情、編輯：轉給訂閱者；會影響 state 的（手機上讀了、收回）順手更新。 */
+function onChatEvent(ev: ChatEvent) {
+  switch (ev.kind) {
+    case "chat-read": {
+      // 在手機上讀了：未讀歸零。writeState 會順便把那個聊天室的 VIP 提醒拿掉。
+      const chat = state.chats.find((c) => c.mid === ev.chat);
+      if (chat && chat.unread) { chat.unread = 0; writeState(); }
+      return push("chat-read", { chat: ev.chat });
+    }
+    case "unsend":
+      // 收回的訊息不該還掛在 VIP 彈窗上。存檔不動：那是你自己的紀錄。
+      if (state.vip.some((a) => a.id === ev.messageId)) {
+        state.vip = state.vip.filter((a) => a.id !== ev.messageId);
+        writeState();
+      }
+      return push("unsend", { chat: ev.chat, messageId: ev.messageId });
+    case "edit":
+      archive(ev.msg); // 同一個 id 再存一筆，就是編輯後的版本
+      return push("edit", ev.msg);
+    default:
+      return push(ev.kind, ev);
+  }
 }
 
 const VIP_ALERTS_MAX = 20;
@@ -301,6 +359,81 @@ function alertVip(chatName: string, fromName: string, preview: string) {
     console.warn("VIP 提醒發不出去：", (err as NodeJS.ErrnoException).code === "ENOENT"
       ? "沒有 notify-send（libnotify）" : err.message);
   });
+}
+
+// ------------------------------------------------------------------ 對帳
+//
+// 推送可能「連線還在但不再送東西」，linejs 看不出來，enil 也就整個靜下來 —— 包括 VIP 提醒。
+// 每次 resync 拿伺服器上各聊天室最後一則的時間，跟我們收到過的比：伺服器比較新、而且已經
+// 過了推送該到的時間，就把那幾則補抓回來（照常存檔、推給介面、VIP 提醒）。
+// 補抓本身就修好了漏掉的訊息；連續兩輪都要補、而推送那邊又好幾分鐘沒動靜，判定推送死了，
+// 讓 systemd 重啟整個 daemon（同一個 process 裡重新 listen 不可靠，見 line.ts onTrouble）。
+
+/** 收到過的訊息 id。推送和對帳可能交出同一則。 */
+const seen = new Set<string>();
+const SEEN_MAX = 5000;
+/** 各聊天室我們知道的最新訊息時間（推送來的、補抓的、或啟動時從存檔讀的）。 */
+const known = new Map<string, number>();
+/** 推送最後一次交來訊息的時間。 */
+let lastPushAt = Date.now();
+/** 連續幾輪 resync 都有補抓。 */
+let missRounds = 0;
+
+/** 推送正常時，訊息應該在這段時間內到。比它新的先不算漏。 */
+const PUSH_GRACE_MS = 20_000;
+/** 補抓只看最近這麼久有動靜的聊天室：太舊的就算漏了也已經不是「即時」的事。 */
+const CATCHUP_WINDOW_MS = 24 * 3600_000;
+/** 一輪最多補幾個聊天室，每個是一次 LINE 請求。 */
+const CATCHUP_MAX_CHATS = 10;
+
+/** 啟動時用存檔當起點：daemon 停掉的那段時間進來的訊息，第一輪 resync 就會補回來。 */
+function seedKnownFromArchive() {
+  try {
+    for (const line_ of readFileSync(ARCHIVE_FILE, "utf8").split("\n")) {
+      if (!line_) continue;
+      try {
+        const m = JSON.parse(line_);
+        known.set(m.chat, Math.max(known.get(m.chat) ?? 0, Number(m.time) || 0));
+        seen.add(String(m.id));
+      } catch { /* 壞掉的一行 */ }
+    }
+    while (seen.size > SEEN_MAX) seen.delete(seen.values().next().value!);
+  } catch { /* 還沒有存檔 */ }
+}
+
+async function catchUp(chats: Chat[]) {
+  const now = Date.now();
+  const behind = chats.filter((c) => {
+    const k = known.get(c.mid);
+    // 沒見過的聊天室（存檔裡沒有）：當作起點，不補 —— 不然第一次跑會把每個聊天室都抓一遍。
+    if (k === undefined) { known.set(c.mid, c.lastTime); return false; }
+    return c.lastTime > k + 5_000 && now - c.lastTime > PUSH_GRACE_MS && now - c.lastTime < CATCHUP_WINDOW_MS;
+  }).slice(0, CATCHUP_MAX_CHATS);
+
+  let missed = 0;
+  for (const c of behind) {
+    try {
+      const after = known.get(c.mid) ?? 0;
+      for (const m of await line!.history(c.mid, 10)) {
+        if (m.time > after && !seen.has(m.id)) { onIncoming(m, true); missed++; }
+      }
+      known.set(c.mid, Math.max(known.get(c.mid) ?? 0, c.lastTime));
+    } catch (err) {
+      console.warn("補抓失敗：", c.mid.slice(0, 8), (err as Error)?.message ?? err);
+    }
+  }
+  if (missed) console.warn(`推送漏了 ${missed} 則，已補抓`);
+
+  missRounds = missed ? missRounds + 1 : 0;
+  if (missRounds >= 2 && now - lastPushAt > 3 * 60_000) {
+    restart("推送連續兩輪漏訊息，而且三分鐘沒收到任何推送");
+  }
+}
+
+/** 推送救不回來：結束 process，讓 systemd（Restart=on-failure）重開、用快取憑證重新登入。 */
+function restart(reason: string) {
+  console.error(`推送失效（${reason}），5 秒後重啟 daemon`);
+  setTimeout(() => process.exit(1), 5_000);
 }
 
 // 送過 subscribe 的連線。之後每則新訊息都會收到一行 { event: "message", data: Msg }。
@@ -427,25 +560,20 @@ async function startLogin(force: boolean): Promise<void> {
     writeState();
     console.log(`✅ ${line.me.displayName}｜${state.chats.length} 個聊天室`);
     void fillPreviews();
-    line.onMessage(onIncoming);
-    // OpenChat 只存檔，不進 state.chats —— chats() 看不到 square，下一次 resync
-    // 就會把它們洗掉，結果是聊天室清單每分鐘閃一次。要顯示得先讓 chats 認識
-    // square，那是另一件事。
-    setInterval(async () => {
-      try {
-        for (const m of await line!.squareMessages()) archive(m);
-      } catch (err) {
-        console.warn("OpenChat 拉取失敗：", (err as Error)?.message ?? err);
-      }
-    }, SQUARE_MS);
-    setInterval(async () => {
-      try {
-        mergeChats(await line!.chats(50));
-        writeState();
-      } catch (err) {
-        console.warn("resync 失敗：", (err as Error)?.message ?? err);
-      }
-    }, RESYNC_MS);
+    lastPushAt = Date.now();
+    line.onMessage((m) => onIncoming(m));
+    line.onEvents(onChatEvent);
+    line.onTrouble((kind, detail) => {
+      if (kind === "push-dead") return restart(detail);
+      // 被踢：憑證已經沒用了，重開也一樣。停在「要重新登入」，等人處理。
+      console.error("這台裝置的登入被取消了：", detail);
+      line = undefined;
+      state.login = {
+        status: "error",
+        error: "這台裝置的登入被取消了（可能在別台機器登入了 enil，或在手機上登出）。重新登入即可。",
+      };
+      writeState();
+    });
   } catch (err) {
     clearQr();
     const message = (err as Error)?.message ?? String(err);
@@ -463,6 +591,31 @@ async function startLogin(force: boolean): Promise<void> {
   }
 }
 
+// 定期工作。只建一次，跟登入幾次無關（被踢之後重新登入不會疊出第二組）；沒登入時跳過。
+//
+// OpenChat 只存檔，不進 state.chats —— chats() 看不到 square，下一次 resync 就會把它們
+// 洗掉，結果是聊天室清單每分鐘閃一次。要顯示得先讓 chats 認識 square，那是另一件事。
+setInterval(async () => {
+  if (!line) return;
+  try {
+    for (const m of await line.squareMessages()) archive(m);
+  } catch (err) {
+    console.warn("OpenChat 拉取失敗：", (err as Error)?.message ?? err);
+  }
+}, SQUARE_MS);
+setInterval(async () => {
+  if (!line) return;
+  try {
+    const chats = await line.chats(50);
+    mergeChats(chats);
+    writeState();
+    await catchUp(chats);
+  } catch (err) {
+    console.warn("resync 失敗：", (err as Error)?.message ?? err);
+  }
+}, RESYNC_MS);
+
+seedKnownFromArchive();
 // 啟動只試快取憑證；沒有就停在 idle 等人按登入。
 void startLogin(false);
 

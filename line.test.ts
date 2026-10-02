@@ -12,7 +12,7 @@ import assert from "node:assert";
 import { createHash, createHmac } from "node:crypto";
 // 動態 import：靜態 import 會被提到最前面，比上面那行設環境變數還早執行，
 // 那樣 paths.js 算出來的就是真的狀態目錄。
-const { chunkedMac, flexOf, safeExt } = await import("./line.js");
+const { chunkedMac, flexOf, safeExt, mentionsOf, mentionMeta, reactionName } = await import("./line.js");
 
 const flex = flexOf(JSON.stringify({
   type: "bubble",
@@ -86,5 +86,22 @@ assert.equal(safeExt("a.sh\n"), undefined);
   assert.equal(isVip("u"), false); // 整行比對，不是前綴
   rmSync(process.env.ENIL_STATE_DIR!, { recursive: true });
 }
+
+// @提及：收到時解析、送出時組回去，兩邊要對得上。
+{
+  const meta = mentionMeta([{ mid: "u1", start: 0, end: 6 }, { mid: "u2", start: 7, end: 10 }]);
+  assert.equal(meta, '{"MENTIONEES":[{"S":"0","E":"6","M":"u1"},{"S":"7","E":"10","M":"u2"}]}');
+  assert.deepEqual(mentionsOf(meta), ["u1", "u2"]);
+  assert.deepEqual(mentionsOf('{"MENTIONEES":[{"S":"0","E":"4","A":"1"}]}'), ["all"]); // @所有人
+  assert.equal(mentionsOf(undefined), undefined);
+  assert.equal(mentionsOf("壞掉"), undefined);
+  assert.equal(mentionsOf('{"MENTIONEES":[]}'), undefined);
+}
+
+// 表情：linejs 有時給編號、有時給名稱。
+assert.equal(reactionName(2), "NICE");
+assert.equal(reactionName("LOVE"), "LOVE");
+assert.equal(reactionName(99), "99");
+assert.equal(reactionName(undefined), "OTHER"); // 自訂／付費回應
 
 console.log("ok");

@@ -6,7 +6,7 @@
     "line": "tsx cli.ts"
   },
   "dependencies": {
-    "@evex/linejs": "npm:@jsr/evex__linejs@^3.3.3",
+    "@evex/linejs": "npm:@jsr/evex__linejs@^3.4.2",
     "qrcode-terminal": "^0.12.0",
     "tweetnacl": "^1.0.3"
   },

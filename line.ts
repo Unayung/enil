@@ -37,6 +37,8 @@ export interface Msg {
   hasMedia: boolean;
   fileName?: string;
   fileSize?: number;
+  /** 影片／語音的長度（毫秒）。影片的 metadata 是 DURATION，語音以前叫 AUDLEN，兩個都看 */
+  duration?: number;
   /** 圖片縮圖或影片預覽圖的本機路徑（history() 會順手抓好，抓不到就是 undefined） */
   mediaPath?: string;
   /** FLEX / RICH 之類版面訊息的純文字備援（LINE 自己附的 ALT_TEXT） */
@@ -54,11 +56,54 @@ export interface Msg {
   thumbPath?: string;
   /** 發話者大頭貼的本機路徑（history() 順手抓的，沒有副檔名；對方沒設照片就沒有） */
   fromAvatar?: string;
+  /** 自己發的訊息有幾個人讀了（history 才有；一對一時 1 就是「已讀」） */
+  readCount?: number;
+  /** 表情回應：誰、哪一種（NICE／LOVE／FUN／AMAZING／SAD／OMG） */
+  reactions?: { from: string; type: string }[];
+  /** 這則 @ 了誰（mid）；"all" 是 @所有人 */
+  mentions?: string[];
   /** 聊天室名稱。只有 OpenChat 訊息會帶 —— square 的名字事後查不到 */
   chatName?: string;
 }
 
 const FLEX_IMAGE_MAX = 4;
+
+/** 表情回應的種類。LINE 用編號，linejs 有時給編號有時給名稱，一律轉成名稱。 */
+export const REACTIONS = ["ALL", "UNDO", "NICE", "LOVE", "FUN", "AMAZING", "SAD", "OMG"] as const;
+export function reactionName(v: unknown): string {
+  // 沒有 predefinedReactionType 的是 LINE 的自訂／付費回應，內容我們不認得。
+  if (v === undefined || v === null || v === "") return "OTHER";
+  return typeof v === "number" ? REACTIONS[v] ?? String(v) : String(v);
+}
+
+/** contentMetadata.MENTION（{"MENTIONEES":[{"S":"0","E":"5","M":"<mid>"}]}）裡 @ 了誰。 */
+export function mentionsOf(json: string | undefined): string[] | undefined {
+  if (!json) return undefined;
+  try {
+    const list = JSON.parse(json)?.MENTIONEES;
+    if (!Array.isArray(list)) return undefined;
+    const mids = list.map((x: any) => (x?.A ? "all" : String(x?.M ?? ""))).filter(Boolean);
+    return mids.length ? mids : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * 送出時的 MENTION metadata。spans 的 start／end 是 JS 字串索引（UTF-16），linejs 解析時
+ * 也是這樣算（substring）。
+ */
+export function mentionMeta(spans: { mid: string; start: number; end: number }[]): string {
+  return JSON.stringify({ MENTIONEES: spans.map((x) => ({ S: String(x.start), E: String(x.end), M: x.mid })) });
+}
+
+/** 推送來的「不是新訊息」的事件。 */
+export type ChatEvent =
+  | { kind: "read"; chat: string; reader: string; messageId: string }
+  | { kind: "chat-read"; chat: string }
+  | { kind: "unsend"; chat: string; messageId: string }
+  | { kind: "reaction"; chat: string; messageId: string; from: string; type: string }
+  | { kind: "edit"; msg: Msg };
 
 /** fetchMyEvents 一輪最多翻幾頁。保險絲：伺服器要是一直回 continuationToken 不能無限拉。 */
 const SQUARE_MAX_PAGES = 20;
@@ -286,7 +331,7 @@ export class Line {
         messageBoxId: chatMid,
         endMessageId: anchor,
         messagesCount: count,
-        withReadCount: false,
+        withReadCount: true,
         receivedOnly: false,
         lastOpRevision: 0,
       },
@@ -349,8 +394,75 @@ export class Line {
     });
   }
 
-  async send(chatMid: string, text: string): Promise<void> {
-    await this.#client.sendCompactMessage(chatMid, text);
+  /** mentions 有給就帶 MENTION metadata（compact 訊息帶不了 metadata，要走一般的 sendMessage）。 */
+  async send(chatMid: string, text: string, mentions?: { mid: string; start: number; end: number }[]): Promise<void> {
+    if (!mentions?.length) {
+      await this.#client.sendCompactMessage(chatMid, text);
+      return;
+    }
+    const meta = { MENTION: mentionMeta(mentions) };
+    try {
+      await this.#base.talk.sendMessage({ to: chatMid, text, contentMetadata: meta });
+    } catch {
+      // E2EE 聊天室：明文送會被拒，改加密。metadata 留在外面（linejs 只加密 text）。
+      await this.#base.talk.sendMessage({ to: chatMid, text, contentMetadata: meta, e2ee: true });
+    }
+  }
+
+  /** 收回自己的訊息。 */
+  async unsend(messageId: string): Promise<void> {
+    await this.#base.talk.unsendMessage({ seq: await this.#base.getReqseq("talk"), messageId });
+  }
+
+  /** 表情回應。type 是 REACTIONS 裡的名稱；UNDO 是收回自己的回應。 */
+  async react(messageId: string, type: string): Promise<void> {
+    if (!REACTIONS.includes(type as any) || type === "ALL") throw new Error(`不認得的表情：${type}`);
+    await this.#base.talk.react({ id: BigInt(messageId), reaction: type as any });
+  }
+
+  /** 群組成員（打 @ 時挑人用）：mid 與顯示名稱，不含自己。 */
+  async members(chatMid: string): Promise<{ mid: string; name: string }[]> {
+    const { chats } = await this.#base.talk.getChats({ chatMids: [chatMid], withMembers: true, withInvitees: false });
+    const mids = Object.keys(chats?.[0]?.extra?.groupExtra?.memberMids ?? {}).filter((m) => m !== this.me.mid);
+    await this.#resolveNames(mids, mids.map(() => "USER"));
+    return mids.map((mid) => ({ mid, name: this.#names.get(mid) ?? mid.slice(0, 8) }));
+  }
+
+  /**
+   * 「不是新訊息」的推送：已讀、收回、表情、編輯。linejs 只把新訊息與編輯包成事件，
+   * 其餘要從原始 Operation 自己認（欄位意思照 linejs 的 example/_event/talk-class.ts）。
+   */
+  onEvents(cb: (ev: ChatEvent) => void): void {
+    this.#client.on("event", (op: any) => {
+      try {
+        const [p1, p2, p3] = [String(op.param1 ?? ""), String(op.param2 ?? ""), String(op.param3 ?? "")];
+        switch (op.type) {
+          case "NOTIFIED_READ_MESSAGE": // 別人讀了：聊天室、誰、讀到哪則
+            return cb({ kind: "read", chat: p1, reader: p2, messageId: p3 });
+          case "SEND_CHAT_CHECKED": // 我在別的裝置（手機）讀了
+            return cb({ kind: "chat-read", chat: p1 });
+          case "DESTROY_MESSAGE": // 我在手機上收回
+          case "NOTIFIED_DESTROY_MESSAGE": // 別人收回
+            return cb({ kind: "unsend", chat: p1, messageId: p2 });
+          case "SEND_REACTION": // 我在別的裝置回應
+          case "NOTIFIED_SEND_REACTION": { // 別人回應：訊息、{chatMid, curr}、誰
+            const info = JSON.parse(p2 || "{}");
+            const from = op.type === "SEND_REACTION" ? this.me.mid : p3;
+            const type = reactionName(info?.curr?.predefinedReactionType ?? "UNDO");
+            return cb({ kind: "reaction", chat: String(info?.chatMid ?? ""), messageId: p1, from, type });
+          }
+        }
+      } catch (err) {
+        console.warn("處理事件失敗：", op?.type, (err as Error)?.message ?? err);
+      }
+    });
+    this.#client.on("message:edit", async (m: any) => {
+      try {
+        cb({ kind: "edit", msg: await this.#toMsg(m.raw ?? m) });
+      } catch (err) {
+        console.warn("處理編輯失敗：", (err as Error)?.message ?? err);
+      }
+    });
   }
 
   /**
@@ -395,14 +507,35 @@ export class Line {
    * 分辨來源，存檔與預覽走同一條路。
    */
   onMessage(cb: (m: Msg) => void): void {
+    // linejs 3.4.2 起不替非同步的處理函式接例外 —— 一則訊息出錯不能讓之後的都收不到。
     this.#client.on("message", async (m: any) => {
-      const raw = m.raw ?? m;
-      this.#noteAnchor(raw);
-      await this.#resolveNames([raw.from], ["USER"]);
-      cb(await this.#toMsg(raw));
+      try {
+        const raw = m.raw ?? m;
+        this.#noteAnchor(raw);
+        await this.#resolveNames([raw.from], ["USER"]);
+        cb(await this.#toMsg(raw));
+      } catch (err) {
+        console.warn("處理收到的訊息失敗：", (err as Error)?.message ?? err);
+      }
     });
     // OpenChat 不走這裡 —— 見 squareMessages()。
     this.#client.listen({ talk: true });
+  }
+
+  /**
+   * 連線出問題時通知呼叫端。兩種情況 linejs 自己救不回來：
+   *   - kicked：伺服器說這台裝置不再被授權（在別台登入、在手機上登出）。linejs 會刪掉
+   *     authToken、停掉推送並發出 "end"。
+   *   - push-dead：推送初始化失敗，迴圈結束（3.4.2 記成 LegyPusherError_cannot_init）。
+   *     一般的連線中斷 linejs 會等 4 秒自己重連，記成 LegyPusherError，那種不用管。
+   * 「連線還在但不再送東西」的卡死 linejs 看不出來，那個靠 daemon 對帳（見 daemon.ts catchUp）。
+   */
+  onTrouble(cb: (kind: "kicked" | "push-dead", detail: string) => void): void {
+    this.#base.on("end", () => cb("kicked", "NOT_AUTHORIZED_DEVICE"));
+    this.#base.on("log", ({ type, data }: { type: string; data: any }) => {
+      if (type === "LegyPusherError_cannot_init") cb("push-dead", String(data?.error?.message ?? data?.error ?? ""));
+      else if (type.endsWith("sync error:")) console.warn("推送同步出錯（之後可能不再收到訊息）：", data);
+    });
   }
 
   /** fetchMyEvents 的增量游標。空字串代表「從頭」，第一次拉會帶回積壓的事件。 */
@@ -751,10 +884,21 @@ export class Line {
       hasMedia: MEDIA_TYPES.has(contentType),
       fileName: await this.#fileNameOf(raw),
       fileSize: size > 0 ? size : undefined,
+      duration: Number(raw.contentMetadata?.DURATION ?? raw.contentMetadata?.AUDLEN ?? 0) || undefined,
       altText,
       flexImages: flex?.images,
       flexText: flex?.text || undefined,
       flexLinks: flex?.links.length ? flex.links : undefined,
+      // 已讀數只對自己發的有意義；伺服器對別人的訊息也可能填，不要。
+      readCount: raw.from === this.me.mid && Number(raw.readCount) > 0 ? Number(raw.readCount) : undefined,
+      reactions: Array.isArray(raw.reactions) && raw.reactions.length
+        ? raw.reactions.map((r: any) => ({
+          from: String(r?.fromUserMid ?? ""),
+          type: reactionName(r?.reactionType?.predefinedReactionType),
+        }))
+        : undefined,
+      // 解密之後才讀：E2EE 訊息的 MENTION 可能在加密的內容裡，decrypt 會把它併回 contentMetadata。
+      mentions: mentionsOf(raw.contentMetadata?.MENTION),
     };
   }
 

@@ -29,7 +29,7 @@ daemon 因此存在，其餘全部是它的消費者（走 unix socket）。加�
 
 ## linejs 的四個 bug（不要「修回去」）
 
-用 `@evex/linejs` 3.3.3。以下是刻意繞過的，不是我們寫錯 —— 但 3.3.3 已經修掉其中兩個
+用 `@evex/linejs` 3.4.2（2026-10-02 從 3.3.3 升上來，enil 用到的接口沒有改簽名）。以下是刻意繞過的，不是我們寫錯 —— 但 3.3.3 已經修掉其中兩個
 （2026-09-09 對著 node_modules 查證），我們的繞法留著只是多一層保險，不是還在救火：
 
 | 位置 | 問題 | 我們的作法 |
@@ -82,6 +82,37 @@ storage 裡的 keyId 標籤是對的、內容是錯的，光看檔案完全看�
   square 要走 `obs.downloadMessageData({ isSquare: true })`，那條是通的。
   兩條的錯誤訊息都是 `Invalid mid`，只包其中一條加診斷會誤判成整條路不通 ——
   我就這樣繞了一輪，結論還下錯（以為要整個逆向 square 的 E2EE 媒體路徑）。
+
+## 推送不可靠，所以要對帳（2026-10-02）
+
+linejs 3.4.2 會自己重連一般的斷線（記成 `LegyPusherError`，4 秒後重試），但有兩種它看不出來：
+
+- **卡死**：`connManager.ts` 的 sync 回錯誤後，後面的 TypeError 被 `catch (_e){return}` 吞掉，
+  連線靠 ping 維持著，卻再也不送東西。只會留一筆 `[LEGY/PUSH] sync error:` log。
+- **revision 只在記憶體**：daemon 重開後從 0 開始，停機期間的訊息不會補推。
+
+所以 daemon 每次 resync（每分鐘）拿 `chats()` 的 `lastDeliveredMessageId.deliveredTime` 跟
+`known`（我們收過的最新時間）比，伺服器比較新、而且超過 20 秒，就用 `history` 補抓。`known`
+與 `seen` 啟動時從 `archive.jsonl` 讀，所以停機期間的也補得回來。補抓的走 `onIncoming(m, true)`
+—— 不加未讀（resync 已經跟伺服器對齊過），但照樣存檔、推送、VIP 提醒。
+
+判定推送死了要兩個條件同時成立：連續兩輪都要補，**而且**三分鐘沒收到任何推送。只看「有補」
+會誤判：有些訊息可能本來就不走推送（系統訊息之類），那種每次都會補一則。重啟是 `process.exit(1)`
+讓 systemd 拉起來 —— 同一個 process 裡再 `listen()` 不可靠：推送迴圈還活著時 `islisten` 會擋住，
+卻又會換掉 stream，舊的 `for await` 就餓死了。
+
+## 不是新訊息的推送
+
+linejs 只把新訊息（`message`）和編輯（`message:edit`）包成事件，已讀、收回、表情要自己從
+`client.on("event", op)` 認 `op.type`（字串）。param 的意思 linejs 核心沒有解釋，照的是它的
+`example/_event/talk-class.ts`：`NOTIFIED_READ_MESSAGE`（聊天室、讀者、讀到哪則）、
+`SEND_CHAT_CHECKED`（我在手機上讀了）、`DESTROY_MESSAGE`／`NOTIFIED_DESTROY_MESSAGE`
+（聊天室、訊息）、`SEND_REACTION`／`NOTIFIED_SEND_REACTION`（訊息、`{chatMid, curr}` JSON、誰）。
+自我聊天室裡實測過收回與表情；已讀要別人讀才看得到，沒實測過推送那條，history 的
+`readCount` 有。
+
+`history` 要帶 `withReadCount: true` 才有已讀數。表情在 `raw.reactions`，沒有
+`predefinedReactionType` 的是自訂／付費回應，記成 `OTHER`。
 
 ## 自動化的邊界
 

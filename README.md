@@ -184,20 +184,42 @@ omarchy plugin add https://github.com/Unayung/omarchy-line.git --enable
 | `login` | — | 觸發 QR 登入（沒有快取憑證時） |
 | `chats` | `limit` `query` | 聊天室陣列（含 `lastText`／`lastFrom` 預覽；前 60 個帶 `avatar`） |
 | `history` | `chat` `count` `markRead` `before` | 訊息陣列（舊到新） |
-| `send` | `chat` `text` | `{sent:true}` |
+| `send` | `chat` `text` `mentions` | `{sent:true}`。`mentions` 是 `[{mid,start,end}]`，位置是 `text` 的 UTF-16 索引 |
+| `unsend` | `messageId` | `{unsent:true}`（只能收回自己的，LINE 限 24 小時內） |
+| `react` | `messageId` `type` | `{reacted:true}`。`type`：`NICE` `LOVE` `FUN` `AMAZING` `SAD` `OMG`，`UNDO` 收回自己的回應 |
+| `members` | `chat` | 群組成員 `[{mid,name}]`，不含自己 |
 | `sendFile` | `chat` `path` | `{oType,e2ee}` |
 | `download` | `messageId` `preview` | `{path}` |
 | `squares` | — | 加入的 OpenChat |
 | `squareHistory` | `chat` `count` | 某個 OpenChat 的訊息 |
 | `subscribe` | — | 見下 |
 
-`subscribe` 把那條連線變成推送用的：先回一行 `{ok:true}`，之後每收到一則新訊息就寫
-一行 `{"event":"message","data":<訊息>}`，直到連線關閉。登入前就能訂。請求照舊另開
-連線，不要跟訂閱共用。OpenChat 的訊息不會被推送。
+`subscribe` 把那條連線變成推送用的：先回一行 `{ok:true}`，之後每有事件就寫一行
+`{"event":…,"data":…}`，直到連線關閉。登入前就能訂。請求照舊另開連線，不要跟訂閱共用。
+OpenChat 不會被推送。
+
+| event | data |
+|---|---|
+| `message` | 一則新訊息（推送來的，或對帳時補抓的） |
+| `edit` | 編輯後的訊息（`id` 跟原本那則一樣） |
+| `unsend` | `{chat, messageId}`。同一次收回可能推兩次 |
+| `read` | `{chat, reader, messageId}`：誰讀到哪則 |
+| `chat-read` | `{chat}`：我在別的裝置（手機）讀了這個聊天室 |
+| `reaction` | `{chat, messageId, from, type}` |
+
+### 漏訊息與斷線
+
+linejs 3.4.2 會自己重連一般的斷線。它看不出來的兩種，daemon 處理：
+
+- **推送卡死**（連線還在，但不再送東西）：daemon 每分鐘對帳，伺服器上有、我們沒收到的訊息
+  會補抓回來，照常存檔、推送、觸發 VIP 提醒。連續兩輪都要補、而且三分鐘沒收到任何推送，
+  就判定推送死了，結束 process 讓 systemd 重開。同一套也補回 daemon 停機期間進來的訊息
+  （以存檔為起點，只看最近 24 小時有動靜的聊天室）。
+- **被踢下線**（在別台登入、在手機上登出）：state 的 `login` 變成 `error`，TUI 會切到登入畫面。
 
 ## 繞過的 linejs 問題
 
-目前用 `@evex/linejs` 3.3.3。有四個問題是在這裡繞過的（其中兩個上游已修，繞法留著
+目前用 `@evex/linejs` 3.4.2。有四個問題是在這裡繞過的（其中兩個上游已修，繞法留著
 當保險）：`loginWithQR` 不看快取憑證、rotate 後的 refresh token 沒存、E2EE 金鑰挑錯
 把、E2EE 影片的驗證碼算法不同導致一律下載失敗。細節與「為什麼長這樣」在
 [`CLAUDE.md`](CLAUDE.md)，改 `login.ts`／`line.ts` 之前先讀。

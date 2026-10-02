@@ -164,6 +164,10 @@ npx tsx cli.ts chats 200 | jq -r 'sort_by(-.lastTime)[0:10][]|"\(.name)：\(.las
 | `fileName` | 檔案名稱（E2EE 的檔案也解得出來） |
 | `thumbPath` | 貼圖、或 FLEX 第一張圖的本機路徑（沒有副檔名），已自動下載 |
 | `fromAvatar` | 發話者大頭貼的本機路徑（沒有副檔名），對方沒設照片就沒有 |
+| `duration` | 影片／語音長度（毫秒） |
+| `readCount` | 自己發的有幾個人讀了（一對一時 1 就是已讀） |
+| `reactions` | 表情回應 `[{from, type}]`，`type` 是 `NICE` `LOVE` `FUN` `AMAZING` `SAD` `OMG`，認不得的是 `OTHER` |
+| `mentions` | 這則 @ 了誰（mid）；`"all"` 是 @所有人 |
 
 ## 長期歷史
 
