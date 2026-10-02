@@ -13,12 +13,13 @@
 // 必須透過 state 交給 UI 顯示，否則第一次登入根本做不到。
 import { createServer, connect as netConnect, type Socket } from "node:net";
 import qrcode from "qrcode-terminal";
-import { appendFileSync, chmodSync, closeSync, mkdirSync, openSync, readdirSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { type Chat, Line, type Msg } from "./line.js";
 import { ARCHIVE_FILE, SOCK, STATE_DIR, STATE_FILE } from "./paths.js";
+import { isVip, vipAlertArgs } from "./vip.js";
 
 const RESYNC_MS = 60_000;      // 定期跟伺服器對齊未讀數
 const SQUARE_MS = 10_000;      // OpenChat 只能自己拉，理由見 line.ts squareMessages()
@@ -36,6 +37,19 @@ interface State {
   updatedAt: number;
   login: { status: LoginStatus; qrPng?: string; url?: string; pin?: string; error?: string };
   chats: (Chat & { lastText: string; lastFrom: string })[];
+  /** VIP 還沒被讀的訊息，舊到新。畫面上要一直看得到，直到那個聊天室被讀了為止。 */
+  vip: VipAlert[];
+}
+
+interface VipAlert {
+  id: string;
+  chat: string;
+  /** 聊天室名稱 */
+  name: string;
+  /** 發話者（一對一時跟 name 一樣） */
+  from: string;
+  text: string;
+  time: number;
 }
 
 let state: State = {
@@ -43,11 +57,15 @@ let state: State = {
   updatedAt: 0,
   login: { status: "starting" },
   chats: [],
+  vip: [],
 };
 let line: Line | undefined;
 
 function writeState() {
   state.updatedAt = Date.now();
+  // VIP 提醒留到那個聊天室被讀了為止 —— 不管是在這台、在手機上讀的（resync 會把 unread
+  // 對齊成 0），都算。每次寫 state 都順手清，不必在每個會動 unread 的地方各寫一次。
+  state.vip = state.vip.filter((a) => (state.chats.find((c) => c.mid === a.chat)?.unread ?? 0) > 0);
   // 先寫暫存再 rename：讀的人（FileView）不會看到寫到一半的檔案。
   const tmp = `${STATE_FILE}.tmp`;
   writeFileSync(tmp, JSON.stringify(state, null, 2));
@@ -93,7 +111,12 @@ function clearQr() {
 // ------------------------------------------------------------------ 指令
 
 const handlers: Record<string, (line: Line, req: any) => Promise<unknown>> = {
-  async state() {
+  async state(_line, req) {
+    // 互動介面順便回報「使用者現在正盯著哪個聊天室」（null = 沒有）。只有 VIP 提醒用得到：
+    // 正在看的那個不必再彈。帶期限是因為介面可能沒道別就消失（當掉、終端機被關）。
+    if ("viewing" in req) {
+      viewing = req.viewing ? { chat: String(req.viewing), until: Date.now() + VIEWING_TTL_MS } : undefined;
+    }
     return state;
   },
   async login() {
@@ -232,10 +255,52 @@ function onIncoming(m: Msg) {
     });
   }
   state.chats.sort((a, b) => b.lastTime - a.lastTime);
+
+  // VIP：除非使用者正盯著那個聊天室，否則留一筆提醒。要在 writeState 之前，才會跟著寫出去。
+  if (m.from !== state.me?.mid && isVip(m.chat)) {
+    const watching = viewing && viewing.chat === m.chat && Date.now() < viewing.until;
+    if (!watching) {
+      const name = chat?.name ?? m.fromName;
+      state.vip = [...state.vip, { id: m.id, chat: m.chat, name, from: m.fromName, text, time: m.time }]
+        .slice(-VIP_ALERTS_MAX);
+      if (!hasOverlay()) alertVip(name, m.fromName, text);
+    }
+  }
+
   writeState();
   // 推給訂閱者。OpenChat 不走 onIncoming，所以不會被推送（見 startLogin）。
   const event = JSON.stringify({ event: "message", data: m }) + "\n";
   for (const sock of subscribers) sock.write(event);
+}
+
+const VIP_ALERTS_MAX = 20;
+
+/**
+ * 有沒有東西會把 state.vip 畫成大彈窗。目前唯一會畫的是 omarchy 外掛（omarchy-line），
+ * 所以看它裝了沒。有的話就不另外發 notify-send，不然同一則訊息會跳兩個東西。
+ * ponytail: 直接認外掛的安裝路徑。出現第二種會畫彈窗的消費者時，改成讓它們自己登記。
+ */
+function hasOverlay(): boolean {
+  return existsSync(join(homedir(), ".config/omarchy/plugins/io.github.unayung.line/Widget.qml"));
+}
+
+// 使用者正盯著的聊天室。介面每 10 秒回報一次，所以期限抓寬一點。
+const VIEWING_TTL_MS = 25_000;
+let viewing: { chat: string; until: number } | undefined;
+
+/**
+ * 沒有大彈窗可用時的退路：一個不會自己消失的系統通知（大小由桌面決定，我們管不了）。
+ * 由 daemon 發而不是介面發 —— 介面沒開、縮小、沒焦點的時候才是最需要它的時候。
+ * ponytail: 只有 notify-send（Linux）。macOS 沒有對應的「不會消失」通知，要用到再想。
+ */
+let warnedNoNotify = false;
+function alertVip(chatName: string, fromName: string, preview: string) {
+  execFile("notify-send", vipAlertArgs(chatName, fromName, preview), (err) => {
+    if (!err || warnedNoNotify) return;
+    warnedNoNotify = true; // 沒裝的話每則都會失敗，講一次就好
+    console.warn("VIP 提醒發不出去：", (err as NodeJS.ErrnoException).code === "ENOENT"
+      ? "沒有 notify-send（libnotify）" : err.message);
+  });
 }
 
 // 送過 subscribe 的連線。之後每則新訊息都會收到一行 { event: "message", data: Msg }。

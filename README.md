@@ -133,6 +133,16 @@ npm run line sread <squareChatMid> 20  # 讀某個 OpenChat
 LINE 伺服器對次要裝置只保留約兩週的歷史。daemon 會把收到的每則訊息存進
 `~/.local/state/enil/archive.jsonl`，那是唯一的長期紀錄，從開始跑的那天算起。
 
+## VIP
+
+在 TUI 裡對某個聊天室按 `Ctrl-P` 設成 VIP（名單存在 `~/.local/state/enil/vip`，一行一個
+mid）。VIP 的新訊息一定要被看到，所以提醒是 daemon 發的，TUI 沒開也一樣：
+
+- 有裝 omarchy 外掛：螢幕中央彈一張大卡片，蓋在所有視窗上，讀過那個聊天室才消失。
+- 沒有：`notify-send -u critical`，不會自己消失的系統通知（需要 libnotify）。
+
+正開著那個聊天室、而且 TUI 有焦點時不提醒。
+
 ## omarchy 外掛
 
 在獨立的 repo：**[omarchy-line](https://github.com/Unayung/omarchy-line)**
@@ -158,7 +168,9 @@ omarchy plugin add https://github.com/Unayung/omarchy-line.git --enable
                                                 // idle = 沒憑證，等人主動要求 QR
   "chats": [{ "mid": "…", "name": "…", "type": "USER|GROUP|ROOM",
               "unread": 0, "lastTime": 0, "lastText": "…", "lastFrom": "…",
-              "avatar": "/…/media/avatar-…" }]  // 最近 50 個；avatar 可能沒有
+              "avatar": "/…/media/avatar-…" }], // 最近 50 個；avatar 可能沒有
+  "vip": [{ "id": "…", "chat": "…", "name": "…", "from": "…", "text": "…", "time": 0 }]
+                                                // VIP 還沒被讀的訊息，聊天室讀過就移除
 }
 ```
 
