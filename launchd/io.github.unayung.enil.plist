@@ -19,19 +19,13 @@
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>-lc</string>
-    <string>exec npx tsx daemon.ts</string>
+    <string>-l</string>
+    <string>@REPO@/daemon.sh</string>
   </array>
 
+  <!-- 找 node 的邏輯在 daemon.sh（跟 systemd 共用），這裡不設 PATH -->
   <key>WorkingDirectory</key>
   <string>@REPO@</string>
-
-  <!-- launchd 給的 PATH 極簡，brew 裝的 node 不在裡面 -->
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>PATH</key>
-    <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-  </dict>
 
   <key>RunAtLoad</key>
   <true/>

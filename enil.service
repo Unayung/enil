@@ -22,9 +22,8 @@ Type=simple
 # 只是為了找得到 daemon.ts 與 node_modules —— 憑證與狀態都在
 # $XDG_STATE_HOME/enil（見 paths.ts），跟從哪裡啟動無關。
 WorkingDirectory=@REPO@
-# node 由 nvm 管理，路徑含版本號（~/.config/nvm/versions/node/vX/bin），
-# 寫死會在升級 node 之後壞掉。用 login shell 讓 nvm 自己解析出當下的版本。
-ExecStart=/bin/bash -lc 'exec npx tsx daemon.ts'
+# 找 node 的邏輯在 daemon.sh（跟 launchd 共用）。-l 讓它先吃 login profile。
+ExecStart=/bin/bash -l @REPO@/daemon.sh
 Restart=on-failure
 RestartSec=5
 # QR 網址與 storage.json 都是憑證，不要外洩到 journal 以外的地方
