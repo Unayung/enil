@@ -1167,6 +1167,8 @@ fn draw(f: &mut Frame, app: &mut App) {
         gap: u16,
         img: Size,
         text: Size,
+        /// 上面被切掉幾列。最舊那則放不下時只畫它的尾端，跟下面接起來。
+        skip: u16,
     }
     // 每則的橫向配置：選取標記(1) 空(1) 大頭貼(4) 空(1) 內容… ↗ 捲軸
     let max_w = inner.width.saturating_sub(AVATAR_W + 6);
@@ -1211,13 +1213,22 @@ fn draw(f: &mut Frame, app: &mut App) {
             let w = (longest + 1).min(max_w).max(1);
             Size::new(w, wrapped_rows(&m.text, w))
         };
-        // 比整個區域還高的訊息（長的 FLEX）就截到剛好一頁，不然它永遠排不進去。
-        let h = (u16::from(sep) + gap + u16::from(head) + img.height + text.height).min(inner.height);
-        if y.saturating_sub(inner.y) < h || h == 0 {
+        let full = u16::from(sep) + gap + u16::from(head) + img.height + text.height;
+        let room = y.saturating_sub(inner.y);
+        if full == 0 || room == 0 {
             break;
         }
-        y -= h;
-        stack.push((Slot { i, sep, head, gap, img, text }, h));
+        if full <= room {
+            y -= full;
+            stack.push((Slot { i, sep, head, gap, img, text, skip: 0 }, full));
+            continue;
+        }
+        // 放不下。以前在這裡直接停，一則長訊息就讓上面留一大片空白、更舊的全部不見。
+        // 最底下那則（整個區域都放不下它）畫開頭，其餘畫尾端：視覺上都是從下往上接。
+        let skip = if stack.is_empty() { 0 } else { full - room };
+        y = inner.y;
+        stack.push((Slot { i, sep, head, gap, img, text, skip }, room));
+        break;
     }
 
     if stack.len() < app.msgs.len() {
@@ -1235,23 +1246,26 @@ fn draw(f: &mut Frame, app: &mut App) {
         y += h;
         // 所有東西都夾在這一則分到的區域裡 —— 被截短的訊息不能畫到別人頭上。
         let put = |r: Rect| r.intersection(area);
-        let mut cy = area.y;
+        // cy 是「沒被切掉時」的位置，上面切掉的列在區域外面（cy 可能比區域頂端還小）。
+        // whole：整個放得進這一則的區域才畫 —— 日期線、名字、大頭貼、圖片切一半沒有意義。
+        let mut cy = area.y as i32 - s.skip as i32;
+        let whole = |y: i32, h: u16| (y >= area.y as i32 && y + h as i32 <= area.bottom() as i32).then_some(y as u16);
 
-        if s.sep {
+        if let Some(y) = whole(cy, 1).filter(|_| s.sep) {
             f.render_widget(
                 Paragraph::new(format!("──────  {}  ──────", model::day_label_long(m.time)))
                     .style(dim())
                     .alignment(Alignment::Center),
-                put(Rect { y: cy, height: 1, ..area }),
+                put(Rect { y, height: 1, ..area }),
             );
-            cy += 1;
         }
-        cy += s.gap;
+        cy += i32::from(s.sep) + s.gap as i32;
 
         let selected = app.cursor == Some(s.i);
         let color = if m.mine { accent } else { sender_color(&m.from_name) };
         let x = inner.x + 3 + AVATAR_W;
-        let body = put(Rect { y: cy, height: area.bottom().saturating_sub(cy), ..area });
+        let top = cy.max(area.y as i32) as u16;
+        let body = put(Rect { y: top, height: area.bottom().saturating_sub(top), ..area });
         app.msg_rects.push((body, s.i));
 
         // Tab 選中的那則，最左邊畫一條。
@@ -1264,11 +1278,13 @@ fn draw(f: &mut Frame, app: &mut App) {
 
         if s.head {
             // 大頭貼：佔名字那行與下一行。
-            let slot = put(Rect { x: inner.x + 2, y: cy, width: AVATAR_W, height: 2 });
-            draw_avatar(
-                f, &mut app.avatars, &app.picker, slot,
-                &m.from, m.avatar_path.as_deref(), &m.from_name, color, on_accent,
-            );
+            if let Some(y) = whole(cy, 2) {
+                let slot = put(Rect { x: inner.x + 2, y, width: AVATAR_W, height: 2 });
+                draw_avatar(
+                    f, &mut app.avatars, &app.picker, slot,
+                    &m.from, m.avatar_path.as_deref(), &m.from_name, color, on_accent,
+                );
+            }
 
             let who = if m.mine { "我" } else { &m.from_name };
             let line = Line::from(vec![
@@ -1280,7 +1296,9 @@ fn draw(f: &mut Frame, app: &mut App) {
                 Span::styled(model::clock(m.time), dim().add_modifier(Modifier::ITALIC)),
             ]);
             let w = line.width() as u16;
-            f.render_widget(Paragraph::new(line), put(Rect { x, y: cy, width: w, height: 1 }));
+            if let Some(y) = whole(cy, 1) {
+                f.render_widget(Paragraph::new(line), put(Rect { x, y, width: w, height: 1 }));
+            }
             cy += 1;
         }
 
@@ -1292,24 +1310,31 @@ fn draw(f: &mut Frame, app: &mut App) {
             } else {
                 Style::new().fg(accent)
             };
-            f.render_widget(
-                Paragraph::new("↗").style(style),
-                put(Rect { x: x + first_w + 1, y: cy, width: 1, height: 1 }),
-            );
+            if let Some(y) = whole(cy, 1) {
+                f.render_widget(
+                    Paragraph::new("↗").style(style),
+                    put(Rect { x: x + first_w + 1, y, width: 1, height: 1 }),
+                );
+            }
         }
 
         if s.img.height > 0 {
-            let r = put(Rect { x, y: cy, width: s.img.width, height: s.img.height });
-            match app.images.get_mut(&m.id) {
-                Some(Some(proto)) => f.render_stateful_widget(StatefulImage::default(), r, proto),
-                _ => f.render_widget(Paragraph::new("[圖片讀不到]").style(dim()), r),
+            if let Some(y) = whole(cy, s.img.height) {
+                let r = put(Rect { x, y, width: s.img.width, height: s.img.height });
+                match app.images.get_mut(&m.id) {
+                    Some(Some(proto)) => f.render_stateful_widget(StatefulImage::default(), r, proto),
+                    _ => f.render_widget(Paragraph::new("[圖片讀不到]").style(dim()), r),
+                }
             }
-            cy += s.img.height;
+            cy += s.img.height as i32;
         }
         if s.text.height > 0 {
+            // 上面被切掉的話，從第 cut 列開始畫（Paragraph 的 scroll），顯示的是尾端。
+            let cut = (area.y as i32 - cy).max(0) as u16;
+            let y = cy.max(area.y as i32) as u16;
             f.render_widget(
-                Paragraph::new(rich(&m.text, accent)).wrap(Wrap { trim: false }),
-                put(Rect { x, y: cy, width: s.text.width, height: s.text.height }),
+                Paragraph::new(rich(&m.text, accent)).wrap(Wrap { trim: false }).scroll((cut, 0)),
+                put(Rect { x, y, width: s.text.width, height: s.text.height.saturating_sub(cut) }),
             );
         }
     }
