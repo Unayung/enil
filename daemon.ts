@@ -679,20 +679,30 @@ async function startLogin(force: boolean): Promise<void> {
         console.log(`\n>>> 到手機 LINE 輸入這組 PIN：  ${pin}\n`);
       },
     }, { qrAllowed: force });
+    // 連上了就是登入了：先標 ok、掛好監聽，再去拿聊天室清單。清單拿不到（例如剛好斷網）只是
+    // 少一份清單，每分鐘的 resync 會補 —— 以前清單那步一丟例外就整個掉進 catch：state 寫成 idle，
+    // line 卻留著，之後每次按登入都被開頭的 `if (line) return` 吞掉，TUI 永遠等不到 QR；
+    // 推送的監聽也沒掛上，新訊息只能靠對帳補抓（實際發生過）。
     line = client;
     clearQr();
     state.me = line.me;
     state.login = { status: "ok" };
-    mergeChats(await line.chats(50));
-    writeState();
-    console.log(`✅ ${line.me.displayName}｜${state.chats.length} 個聊天室`);
-    void fillPreviews();
     lastPushAt = Date.now();
     line.onMessage((m) => onIncoming(m));
     line.onEvents(onChatEvent);
     line.onAnyOp(tallyOp);
     line.onTrouble((kind, detail) => kind === "push-dead" ? restart(detail) : onKicked(detail));
+    try {
+      mergeChats(await line.chats(50));
+    } catch (err) {
+      console.warn("登入了，但聊天室清單還拿不到（下次 resync 再補）：", (err as Error)?.message ?? err);
+    }
+    writeState();
+    console.log(`✅ ${line.me.displayName}｜${state.chats.length} 個聊天室`);
+    void fillPreviews();
   } catch (err) {
+    // 走到這裡就是沒登入成功：line 不能留著，不然下一次登入會被開頭的檢查擋掉
+    line = undefined;
     clearQr();
     const message = (err as Error)?.message ?? String(err);
     if (!force) {
