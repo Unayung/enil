@@ -365,6 +365,8 @@ struct App {
     anim_protos: HashMap<(String, u16, u16), Vec<Protocol>>,
     /// 動畫的時間原點：每一幀用「現在離它多久」決定畫哪一格。
     anim_clock: Instant,
+    /// 對話裡的動態貼圖只播一輪：訊息 id → 這一輪開始的時間。點一下就重設。
+    anim_play: HashMap<String, Instant>,
     /// 擁有的貼圖組（第一次開選單時跟 daemon 要）。
     packs: Vec<StickerPack>,
     /// 貼圖選單的分頁：0 是「最近」，1.. 是 packs[分頁-1]。
@@ -754,6 +756,7 @@ impl App {
         self.open = Some(mid.clone());
         self.msgs.clear();
         self.cursor = None;
+        self.anim_play.clear(); // 預覽時播過的不算：進來就讓畫面上的動態貼圖再播一輪
         // 附件是掛給「剛才那個聊天室」的。帶到下一個聊天室，一個 Enter 就送錯人。
         self.attach = None;
         self.pending_mentions.clear();
@@ -907,7 +910,11 @@ impl App {
             self.status = "已停止".into();
             return;
         }
-        if m.kind == "IMAGE" && m.has_media {
+        if m.sticker.is_some() {
+            // 貼圖：再播一次（靜態貼圖沒有動畫版，這下就沒事）。
+            let id = m.id.clone();
+            self.anim_play.insert(id, Instant::now());
+        } else if m.kind == "IMAGE" && m.has_media {
             let id = m.id.clone();
             self.view_image(id);
         } else if m.has_media {
@@ -1021,8 +1028,9 @@ impl App {
     }
 
     /// 動態貼圖現在該畫的那一格，縮到 size。不是動態貼圖（或還沒解好）就是 None。
+    /// start 是 None 就一直循環（選單）；有給就只播一輪，播完回 None，呼叫端畫回靜態圖。
     /// 每個大小的每一格只建一次 Protocol；之後每一幀只是挑一格畫。
-    fn anim_frame(&mut self, id: &str, size: Size) -> Option<&Protocol> {
+    fn anim_frame(&mut self, id: &str, size: Size, start: Option<Instant>) -> Option<&Protocol> {
         let frames = self.anim_frames.get(id)?.clone();
         let key = (id.to_string(), size.width, size.height);
         if !self.anim_protos.contains_key(&key) {
@@ -1036,7 +1044,11 @@ impl App {
             self.anim_protos.insert(key.clone(), protos);
         }
         let total: u32 = frames.iter().map(|(_, d)| *d).sum::<u32>().max(1);
-        let mut t = (self.anim_clock.elapsed().as_millis() % total as u128) as u32;
+        let mut t = match start {
+            Some(s) if s.elapsed().as_millis() >= total as u128 => return None,
+            Some(s) => s.elapsed().as_millis() as u32,
+            None => (self.anim_clock.elapsed().as_millis() % total as u128) as u32,
+        };
         let mut idx = 0;
         for (i, (_, d)) in frames.iter().enumerate() {
             if t < *d {
@@ -2238,12 +2250,16 @@ fn draw(f: &mut Frame, app: &mut App) {
         if s.img.height > 0 {
             if let Some(y) = whole(cy, s.img.height) {
                 let r = put(Rect { x, y, width: s.img.width, height: s.img.height });
-                // 動態貼圖：跟 daemon 要動畫版，有了就照時間輪播；還沒有就先畫靜態的。
+                // 動態貼圖：跟 daemon 要動畫版，第一次畫出來時播一輪（點了再播），其餘時間畫靜態的。
                 let anim = m.sticker.as_ref().map(|st| st.id.clone());
                 if let Some(id) = &anim {
                     app.want_sticker_image(id);
+                    if app.anim_frames.contains_key(id) && !app.anim_play.contains_key(&m.id) {
+                        app.anim_play.insert(m.id.clone(), Instant::now());
+                    }
                 }
-                if let Some(frame) = anim.as_deref().and_then(|id| app.anim_frame(id, r.as_size())) {
+                let start = app.anim_play.get(&m.id).copied();
+                if let Some(frame) = anim.as_deref().zip(start).and_then(|(id, t)| app.anim_frame(id, r.as_size(), Some(t))) {
                     f.render_widget(ratatui_image::Image::new(frame), r);
                 } else {
                 match app.images.get_mut(&m.id) {
@@ -2680,7 +2696,7 @@ fn draw_overlays(f: &mut Frame, app: &mut App) {
             }
             let img_area = Rect { x: cell.x + 1, y: cell.y, width: cw - 2, height: ch - 1 };
             app.want_sticker_image(&st.id);
-            if let Some(frame) = app.anim_frame(&st.id, img_area.as_size()) {
+            if let Some(frame) = app.anim_frame(&st.id, img_area.as_size(), None) {
                 f.render_widget(ratatui_image::Image::new(frame), img_area);
                 continue;
             }
@@ -3222,6 +3238,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         anim_frames: HashMap::new(),
         anim_protos: HashMap::new(),
         anim_clock: Instant::now(),
+        anim_play: HashMap::new(),
         packs: vec![],
         sticker_tab: 0,
         on_header: None,
