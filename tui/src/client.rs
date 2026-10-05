@@ -112,6 +112,11 @@ pub fn sticker_image(id: &str) -> Result<Value, String> {
     request(json!({ "cmd": "stickerImage", "id": id }))
 }
 
+/// 擁有的貼圖組 [{pkg, ver, name, stickers:[id]}]，最近下載的在前。
+pub fn sticker_packs() -> Result<Value, String> {
+    request(json!({ "cmd": "stickerPacks" }))
+}
+
 /// 好友清單 [{mid, name}]（含還沒聊過的）。
 pub fn contacts() -> Result<Value, String> {
     request(json!({ "cmd": "contacts" }))

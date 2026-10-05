@@ -199,6 +199,7 @@ omarchy plugin add https://github.com/Unayung/omarchy-line.git --enable
 | `contacts` | — | 好友清單 `[{mid,name}]`，含還沒聊過的人（快取 10 分鐘） |
 | `sendSticker` | `chat` `sticker:{id,pkg,ver}` | `{sent:true}` |
 | `stickerImage` | `id` | 某張貼圖的圖檔 `{path}` |
+| `stickerPacks` | — | 擁有的貼圖組 `[{pkg,ver,name,stickers:[id]}]`，最近下載的在前（快取 30 分鐘） |
 | `sendFile` | `chat` `path` | `{oType,e2ee}` |
 | `download` | `messageId` `preview` | `{path}` |
 | `squares` | — | 加入的 OpenChat |

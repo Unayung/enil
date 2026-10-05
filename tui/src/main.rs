@@ -53,6 +53,8 @@ enum Update {
     Downloaded(String),
     /// 貼圖選單要的某張貼圖圖檔好了（貼圖 id、路徑）。
     StickerImage(String, String),
+    /// 擁有的貼圖組。
+    StickerPacks(Vec<StickerPack>),
     /// 圖片原檔下載並解好了（訊息 id、路徑、圖），給看圖畫面。
     ImageReady(String, String, Box<image::DynamicImage>),
     /// 語音下載好了，播放。
@@ -141,6 +143,33 @@ enum ListRow {
     Chat(usize),
     /// 分區標題（分區名稱）。
     Header(String),
+}
+
+/// 一組擁有的貼圖。
+struct StickerPack {
+    name: String,
+    stickers: Vec<model::Sticker>,
+}
+
+fn parse_packs(v: &Value) -> Vec<StickerPack> {
+    v.as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|p| {
+                    let (pkg, ver) = (p.get("pkg")?.as_str()?.to_string(), p.get("ver")?.as_str()?.to_string());
+                    let stickers = p
+                        .get("stickers")?
+                        .as_array()?
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(|id| model::Sticker { id: id.into(), pkg: pkg.clone(), ver: ver.clone() })
+                        .collect::<Vec<_>>();
+                    let name = p.get("name").and_then(Value::as_str).unwrap_or(&pkg).to_string();
+                    (!stickers.is_empty()).then_some(StickerPack { name, stickers })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// 貼圖選單每一格的大小（欄, 列）。
@@ -302,6 +331,12 @@ struct App {
     sticker_pick: Option<usize>,
     /// 貼圖選單的縮圖，依貼圖 id。None = 抓不到或解不開（記住，不要一直重抓）。
     sticker_imgs: HashMap<String, Option<Protocol>>,
+    /// 已經跟 daemon 要了、還沒回來的縮圖（畫面每一幀都會檢查，不能重複要）。
+    sticker_pending: HashSet<String>,
+    /// 擁有的貼圖組（第一次開選單時跟 daemon 要）。
+    packs: Vec<StickerPack>,
+    /// 貼圖選單的分頁：0 是「最近」，1.. 是 packs[分頁-1]。
+    sticker_tab: usize,
     /// 清單游標停在某個分區標題上（那一區的名稱）。這時 selected 不變，Enter／空白鍵切換收合。
     on_header: Option<String>,
     msg_area: Rect,
@@ -936,24 +971,41 @@ impl App {
         });
     }
 
-    /// Ctrl-G：開貼圖選單，順便跟 daemon 要還沒有的縮圖。
+    /// Ctrl-G：開貼圖選單。第一次開時跟 daemon 要擁有的貼圖組；縮圖畫到時才要（見 want_sticker_image）。
     fn open_sticker_picker(&mut self) {
         if self.open.is_none() {
             self.status = "先打開一個聊天室，再按 Ctrl-G 選貼圖".into();
             return;
         }
-        // 空的也照樣打開：在選單裡說明貼圖從哪裡來，比狀態列一行字容易看到。
         self.sticker_pick = Some(0);
-        for st in &self.stickers {
-            if self.sticker_imgs.contains_key(&st.id) {
-                continue;
-            }
-            let id = st.id.clone();
-            self.spawn(move || match client::sticker_image(&id) {
-                Ok(v) => Update::StickerImage(id, v.get("path").and_then(Value::as_str).unwrap_or("").to_string()),
-                Err(_) => Update::StickerImage(id, String::new()),
+        // 「最近」是空的就直接從第一組擁有的貼圖開始。
+        self.sticker_tab = if self.stickers.is_empty() && !self.packs.is_empty() { 1 } else { self.sticker_tab.min(self.packs.len()) };
+        if self.packs.is_empty() {
+            self.spawn(|| match client::sticker_packs() {
+                Ok(v) => Update::StickerPacks(parse_packs(&v)),
+                Err(e) => Update::Error(format!("拿不到擁有的貼圖：{e}")),
             });
         }
+    }
+
+    /// 選單目前這一頁的貼圖。
+    fn sticker_page(&self) -> &[model::Sticker] {
+        match self.sticker_tab {
+            0 => &self.stickers,
+            t => self.packs.get(t - 1).map_or(&[][..], |p| &p.stickers[..]),
+        }
+    }
+
+    /// 畫到某張貼圖時才跟 daemon 要縮圖（一組 40 張，全部預先抓太多）。
+    fn want_sticker_image(&mut self, id: &str) {
+        if self.sticker_imgs.contains_key(id) || !self.sticker_pending.insert(id.to_string()) {
+            return;
+        }
+        let id = id.to_string();
+        self.spawn(move || match client::sticker_image(&id) {
+            Ok(v) => Update::StickerImage(id, v.get("path").and_then(Value::as_str).unwrap_or("").to_string()),
+            Err(_) => Update::StickerImage(id, String::new()),
+        });
     }
 
     /// 選中的那則：r 表情、d 收回。
@@ -1185,7 +1237,14 @@ impl App {
                 self.status.clear();
             }
             Update::Downloaded(path) => self.status = system_open(&path),
+            Update::StickerPacks(p) => {
+                self.packs = p;
+                if self.sticker_pick.is_some() && self.sticker_tab == 0 && self.stickers.is_empty() && !self.packs.is_empty() {
+                    self.sticker_tab = 1;
+                }
+            }
             Update::StickerImage(id, path) => {
+                self.sticker_pending.remove(&id);
                 let proto = image::ImageReader::open(&path)
                     .ok()
                     .and_then(|r| r.with_guessed_format().ok())
@@ -2493,36 +2552,47 @@ fn draw_overlays(f: &mut Frame, app: &mut App) {
 
     if let Some(pick) = app.sticker_pick {
         let (cw, ch) = STICKER_CELL;
-        let area = centered(f.area(), cw * 6 + 2, ch * 4 + 2);
+        let area = centered(f.area(), cw * 6 + 2, ch * 4 + 4);
         f.render_widget(Clear, area);
         let block = pane(Line::from(Span::styled(" 貼圖 ", bold)), true, accent)
-            .title_bottom(Line::from(" 方向鍵選   Enter 送出   Esc 取消 ").right_aligned());
+            .title_bottom(Line::from(" Tab 換一組   方向鍵選   Enter 送出   Esc 取消 ").right_aligned());
         let inner = block.inner(area);
         f.render_widget(block, area);
-        if app.stickers.is_empty() {
-            let lines = vec![
-                Line::from(""),
-                Line::from(Span::styled("還沒有貼圖", bold)),
-                Line::from(""),
-                Line::from("LINE 不讓這種裝置列出你擁有的貼圖，所以這裡只有"),
-                Line::from("你在 enil 裡看過或送過的貼圖。"),
-                Line::from(""),
-                Line::from("打開幾個有人傳過貼圖的聊天室，那些貼圖就會收進來；"),
-                Line::from("或是 Tab 選中一則貼圖訊息，按 s 送一張一樣的。"),
-            ];
-            f.render_widget(Paragraph::new(lines).alignment(Alignment::Center).wrap(Wrap { trim: false }), inner);
+
+        // 分頁列：最近、各組貼圖。目前這頁反白；放不下就從目前這頁往前少列幾個。
+        let mut names = vec!["最近".to_string()];
+        names.extend(app.packs.iter().map(|p| fit(&p.name, 14)));
+        let start = app.sticker_tab.saturating_sub(2);
+        let mut tabs: Vec<Span> = Vec::new();
+        for (i, n) in names.iter().enumerate().skip(start) {
+            let style = if i == app.sticker_tab { Style::new().fg(app.theme.on_accent).bg(accent).add_modifier(Modifier::BOLD) } else { dim() };
+            tabs.push(Span::styled(format!(" {n} "), style));
+            tabs.push(Span::raw(" "));
         }
-        let per_row = (inner.width / cw).max(1) as usize;
-        let rows = (inner.height / ch).max(1) as usize;
-        // 選中的那張永遠看得到：一次一頁，捲到選中那一列。
+        f.render_widget(Paragraph::new(Line::from(tabs)), Rect { height: 1, ..inner });
+        let grid = Rect { y: inner.y + 2, height: inner.height.saturating_sub(2), ..inner };
+
+        let page: Vec<model::Sticker> = app.sticker_page().to_vec();
+        if page.is_empty() {
+            let note = if app.sticker_tab == 0 {
+                "還沒有最近用過的貼圖。按 Tab 看你擁有的貼圖組。"
+            } else {
+                "載入中…"
+            };
+            f.render_widget(Paragraph::new(note).style(dim()).alignment(Alignment::Center), Rect { y: grid.y + 2, height: 1, ..grid });
+        }
+        let per_row = (grid.width / cw).max(1) as usize;
+        let rows = (grid.height / ch).max(1) as usize;
+        // 選中的那張永遠看得到：捲到選中那一列。
         let first_row = (pick / per_row + 1).saturating_sub(rows);
-        for (i, st) in app.stickers.iter().enumerate().skip(first_row * per_row).take(per_row * rows) {
+        for (i, st) in page.iter().enumerate().skip(first_row * per_row).take(per_row * rows) {
             let (col, row) = ((i % per_row) as u16, (i / per_row - first_row) as u16);
-            let cell = Rect { x: inner.x + col * cw, y: inner.y + row * ch, width: cw, height: ch };
+            let cell = Rect { x: grid.x + col * cw, y: grid.y + row * ch, width: cw, height: ch };
             if i == pick {
                 f.render_widget(Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(accent)), cell);
             }
             let img_area = Rect { x: cell.x + 1, y: cell.y, width: cw - 2, height: ch - 1 };
+            app.want_sticker_image(&st.id);
             match app.sticker_imgs.get(&st.id) {
                 Some(Some(p)) => f.render_widget(ratatui_image::Image::new(p), img_area),
                 Some(None) => f.render_widget(Paragraph::new("[貼圖]").style(dim()), img_area),
@@ -3057,6 +3127,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         stickers: load_stickers(),
         sticker_pick: None,
         sticker_imgs: HashMap::new(),
+        sticker_pending: HashSet::new(),
+        packs: vec![],
+        sticker_tab: 0,
         on_header: None,
         msg_rects: vec![],
         cursor: None,
@@ -3257,16 +3330,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         // 貼圖選單開著時，按鍵全部歸它。
         if let Some(pick) = app.sticker_pick {
-            let n = app.stickers.len();
+            let n = app.sticker_page().len();
             let per_row = 6; // 跟畫面一樣：centered 的寬度是 6 格
+            let tabs = app.packs.len() + 1;
             let next = match key.code {
+                // 換一組：回到第一張。
+                KeyCode::Tab => {
+                    app.sticker_tab = (app.sticker_tab + 1) % tabs;
+                    0
+                }
+                KeyCode::BackTab => {
+                    app.sticker_tab = (app.sticker_tab + tabs - 1) % tabs;
+                    0
+                }
                 KeyCode::Left => pick.saturating_sub(1),
                 KeyCode::Right => (pick + 1).min(n.saturating_sub(1)),
                 KeyCode::Up => pick.saturating_sub(per_row),
                 KeyCode::Down => (pick + per_row).min(n.saturating_sub(1)),
                 KeyCode::Enter | KeyCode::Char(' ') => {
                     app.sticker_pick = None;
-                    if let Some(st) = app.stickers.get(pick).cloned() {
+                    if let Some(st) = app.sticker_page().get(pick).cloned() {
                         app.send_sticker(st);
                     }
                     continue;

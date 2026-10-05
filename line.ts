@@ -6,6 +6,7 @@
 // （JWT 標了 rot:ROTATE，回應帶回新的、舊的作廢）。兩個 process 同時啟動
 // 會互相洗掉對方的憑證，最後退回掃 QR。要多個消費者就架一個 daemon 持有唯一 session。
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { LINEStruct } from "@evex/linejs/thrift";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, extname, join } from "node:path";
 import { keepAuthToken, login, type LoginHandlers, type LoginOptions } from "./login.js";
@@ -159,6 +160,34 @@ function stickerUrl(id: string): string {
 export function stickerOf(meta: any): { id: string; pkg: string; ver: string } | undefined {
   const [id, pkg, ver] = [meta?.STKID, meta?.STKPKGID, meta?.STKVER].map((v) => String(v ?? ""));
   return [id, pkg, ver].every((v) => /^\d+$/.test(v)) ? { id, pkg, ver } : undefined;
+}
+
+export interface StickerPack {
+  pkg: string;
+  ver: string;
+  name: string;
+  /** 這一組的貼圖 id，照順序。 */
+  stickers: string[];
+}
+
+const PACKS_TTL_MS = 30 * 60_000;
+const PACKS_PAGE = 100;
+/** 保險絲：伺服器要是一直說還有，不能無限拉。 */
+const PACKS_MAX = 2000;
+
+/** getOwnedProductSummaries 的一筆 → 貼圖組。欄位是數字鍵，見 Line.stickerPacks()。 */
+export function packOf(x: any): StickerPack | undefined {
+  const pkg = String(x?.["1"] ?? "");
+  const ver = String(x?.["21"] ?? "1");
+  const ranges: any[] = x?.["93"]?.["1"]?.["1"] ?? [];
+  const stickers: string[] = [];
+  for (const r of ranges) {
+    const start = Number(r?.["1"]), n = Number(r?.["2"]);
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(n) || n <= 0 || n > 200) continue;
+    for (let i = 0; i < n; i++) stickers.push(String(start + i));
+  }
+  if (!/^\d+$/.test(pkg) || !/^\d+$/.test(ver) || !stickers.length) return undefined;
+  return { pkg, ver, name: String(x?.["11"] ?? pkg), stickers };
 }
 
 /** 好友清單快取多久。 */
@@ -437,6 +466,36 @@ export class Line {
       contentType: "STICKER" as any,
       contentMetadata: { STKID: s.id, STKPKGID: s.pkg, STKVER: s.ver },
     });
+  }
+
+  #packs?: { at: number; list: StickerPack[] };
+
+  /**
+   * 你擁有的貼圖組（貼圖商店的 getOwnedProductSummaries），依最近下載排序。給貼圖選單用。
+   *
+   * linejs 有這個端點（ShopService）但沒從公開入口匯出，也沒有在 BaseClient 上建立，
+   * 所以直接用同一個請求函式打 /TSHOP4。回傳的 thrift 結構 linejs 沒有對應的型別，
+   * 欄位是數字鍵（實測 2026-10-05）：1 貼圖組 id、11 名稱、21 版本、
+   * 93.1.1 是 [{1: 第一張貼圖的 id, 2: 張數}]（同一組的貼圖 id 連號）。最外層 3 是總數。
+   * 過期的活動贈品不在這裡（getPurchasedProducts 才有，owned=false）。快取 30 分鐘。
+   */
+  async stickerPacks(): Promise<StickerPack[]> {
+    if (this.#packs && Date.now() - this.#packs.at < PACKS_TTL_MS) return this.#packs.list;
+    const list: StickerPack[] = [];
+    for (let offset = 0; offset < PACKS_MAX; offset += PACKS_PAGE) {
+      const res: any = await this.#base.request.request(
+        LINEStruct.getOwnedProductSummaries_args({
+          shopId: "stickershop", offset, limit: PACKS_PAGE, locale: { language: "zh_TW", country: "TW" },
+        } as any),
+        "getOwnedProductSummaries", 4, true, "/TSHOP4",
+      );
+      const page: any[] = res?.["1"] ?? res?.productList ?? [];
+      list.push(...page.map(packOf).filter((p): p is StickerPack => !!p));
+      const total = Number(res?.["3"] ?? 0);
+      if (page.length < PACKS_PAGE || list.length >= total) break;
+    }
+    this.#packs = { at: Date.now(), list };
+    return list;
   }
 
   /** 某張貼圖的圖檔（本機路徑），給貼圖選單畫縮圖。跟訊息裡的貼圖走同一個 CDN、同一份快取。 */

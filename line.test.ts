@@ -12,7 +12,7 @@ import assert from "node:assert";
 import { createHash, createHmac } from "node:crypto";
 // 動態 import：靜態 import 會被提到最前面，比上面那行設環境變數還早執行，
 // 那樣 paths.js 算出來的就是真的狀態目錄。
-const { chunkedMac, flexOf, safeExt, mentionsOf, mentionMeta, reactionName, stickerOf } = await import("./line.js");
+const { chunkedMac, flexOf, safeExt, mentionsOf, mentionMeta, reactionName, stickerOf, packOf } = await import("./line.js");
 
 const flex = flexOf(JSON.stringify({
   type: "bubble",
@@ -131,5 +131,12 @@ assert.deepEqual(stickerOf({ STKID: "52002734", STKPKGID: "11537", STKVER: "1" }
 assert.equal(stickerOf({ STKID: "52002734", STKPKGID: "11537" }), undefined);
 assert.equal(stickerOf({ STKID: "1/../x", STKPKGID: "1", STKVER: "1" }), undefined);
 assert.equal(stickerOf(undefined), undefined);
+
+// 擁有的貼圖組：數字鍵的 thrift 結構 → 貼圖 id 清單（同一組連號）。
+assert.deepEqual(packOf({ "1": "6427", "11": "Doraemon", "21": 2, "93": { "1": { "1": [{ "1": 11256040, "2": 3 }] } } }),
+  { pkg: "6427", ver: "2", name: "Doraemon", stickers: ["11256040", "11256041", "11256042"] });
+assert.equal(packOf({ "1": "6427", "21": 1, "93": { "1": { "1": [] } } }), undefined); // 沒有貼圖
+assert.equal(packOf({ "1": "x/../", "21": 1, "93": { "1": { "1": [{ "1": 1, "2": 1 }] } } }), undefined); // id 不是數字
+assert.equal(packOf({ "1": "1", "21": 1, "93": { "1": { "1": [{ "1": 1, "2": 99999 }] } } }), undefined); // 張數不合理
 
 console.log("ok");
