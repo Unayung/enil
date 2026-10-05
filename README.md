@@ -77,13 +77,13 @@ TUI 要另外編（見 [`tui/README.md`](tui/README.md)）：
 
 ```bash
 cd tui && cargo build --release
-ln -s "$PWD/target/release/enil-tui" ~/.local/bin/enil-tui
+ln -sf "$PWD/target/release/enil" ~/.local/bin/enil
 ```
 
 ### 登入
 
 **QR 只在有人要求時才產生。** daemon 啟動只會試快取憑證；沒有可用憑證就停在
-`idle`，等你開 `enil-tui`（它會顯示登入畫面）或跑 `npm run line login`。
+`idle`，等你開 `enil`（TUI，會顯示登入畫面）或跑 `npm run line login`。
 
 這是刻意的：QR 需要有人拿手機在旁邊，自動產生只會在無人時留下一張沒人掃的憑證，
 並持續敲 LINE 的伺服器。
@@ -96,7 +96,7 @@ QR 的顯示方式依 daemon 怎麼啟動而定：
 | systemd／pipe（非 TTY） | 寫成 PNG，路徑印在 log 也放進 `state.json` |
 | 非 TTY 且沒有 `qrencode` | 不產 PNG；log 與 `state.json` 只給登入網址與原因 |
 
-所以 daemon 在背景跑時也能完成登入 —— `enil-tui` 的登入畫面就是把 `state.json` 裡
+所以 daemon 在背景跑時也能完成登入 —— `enil` 的登入畫面就是把 `state.json` 裡
 那張 PNG 畫出來，再顯示要在手機上輸入的 PIN。
 
 ## 三種介面
@@ -158,7 +158,7 @@ mid）。VIP 的新訊息一定要被看到，所以提醒是 daemon 發的，TU
 omarchy plugin add https://github.com/Unayung/omarchy-line.git --enable
 ```
 
-它只讀 `state.json`，本身不碰 LINE。點圖示會開 `~/.local/bin/enil-tui`。
+它只讀 `state.json`，本身不碰 LINE。點圖示會開 `~/.local/bin/enil`（沒有的話找舊名 `enil-tui`）。
 
 ## 對外契約
 

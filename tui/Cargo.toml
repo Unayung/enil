@@ -1,5 +1,5 @@
 [package]
-name = "enil-tui"
+name = "enil"
 version = "0.1.0"
 edition = "2024"
 
@@ -15,5 +15,5 @@ image = "0.25.10"
 unicode-width = "0.2"
 
 [[bin]]
-name = "enil-tui"
+name = "enil"
 path = "src/main.rs"

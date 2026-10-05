@@ -1,4 +1,4 @@
-# enil-tui
+# enil（TUI）
 
 在終端機用 LINE。ratatui + crossterm。
 

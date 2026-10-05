@@ -1,4 +1,4 @@
-//! enil-tui —— 在終端機用 LINE。
+//! enil —— 在終端機用 LINE（執行檔叫 enil；舊名 enil-tui 留作相容連結）。
 //!
 //! 這支程式不碰 LINE 協定：它只是 enil daemon 的消費者，
 //! 走 unix socket 收發一行一個 JSON。跟 omarchy 外掛是同一個契約。

@@ -668,7 +668,7 @@ async function startLogin(force: boolean): Promise<void> {
           console.log("\n用手機 LINE 掃下面的 QR：\n" + url + "\n");
           qrcode.generate(url, { small: true });
         } else if (path) {
-          console.log(`QR 已寫入 ${path}（enil-tui 的登入畫面會顯示它）`);
+          console.log(`QR 已寫入 ${path}（enil 的登入畫面會顯示它）`);
         } else {
           console.log(`沒有 PNG，用這個網址登入：\n${url}`);
         }
@@ -710,7 +710,7 @@ async function startLogin(force: boolean): Promise<void> {
       // 原因要寫進 state：TUI 的登入畫面會顯示，人才知道是被別台踢了還是網路斷了。
       const reason = err instanceof NeedsQrLogin ? err.reason : undefined;
       state.login = reason ? { status: "idle", error: reason } : { status: "idle" };
-      console.log(reason ?? "沒有可用的憑證。開 enil-tui 登入，或跑 cli.ts login。");
+      console.log(reason ?? "沒有可用的憑證。開 enil 登入，或跑 cli.ts login。");
     } else {
       console.warn("登入失敗：", message);
       state.login = { status: "error", error: message + "（再按一次登入可重試）" };
