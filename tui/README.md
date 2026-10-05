@@ -28,16 +28,52 @@
 視窗寬度在 50 欄以內時改成單欄：沒開聊天室顯示清單，開了就只顯示對話，Esc 回清單。
 拉寬回來會自動變回兩欄。門檻是 `main.rs` 裡的 `NARROW_COLS`。
 
-## 配色
+## 主題
 
-在 omarchy 上會跟著系統主題走，換主題時不用重開：
+`Ctrl-Y` 換主題：游標移到哪個，整個畫面就先換成那個（預覽），Enter 套用、Esc 還原。
+選擇存在 `~/.config/enil/theme`，下次開還是同一個。
 
-- 發話者顏色與調暗用終端機調色盤的色號。omarchy 換主題時會叫終端機重載調色盤，
-  這些顏色自己就會變。
-- 強調色與選取底色不在調色盤裡，從 `~/.local/state/omarchy/current/theme/colors.toml`
-  讀（`accent`、`selection`、`background`），每秒看一次檔案有沒有變。
+| 主題 | 說明 |
+|---|---|
+| Omarchy（預設） | 讀 `~/.local/state/omarchy/current/theme/colors.toml`：背景、文字、強調色、選取色、次要文字都用系統主題的，換主題時一秒內跟著換。不是 omarchy 就跟「終端機」一樣 |
+| 終端機 | 不畫背景，顏色全用終端機調色盤的色號，跟終端機自己的配色走 |
+| 內建 | 從 slk 移植的 15 個：Catppuccin Mocha／Latte、Tokyo Night、Dracula、Gruvbox Dark、Nord、One Dark、Rosé Pine、Solarized Dark／Light、Everforest Dark、Kanagawa、GitHub Dark、Monokai、Cyberpunk Neon |
+| 自訂 | `~/.config/enil/themes/*.toml`，也會讀 `~/.config/slk/themes/*.toml` —— 格式跟 slk 一樣，slk 的自訂主題可以直接用 |
 
-不是 omarchy（沒有那個檔）就全部用調色盤的色號，強調色是綠色。
+自訂主題範例（`name`、`primary`、`background` 必填，其餘可省）：
+
+```toml
+name = "My Theme"
+
+[colors]
+primary            = "#BD93F9"   # 強調色
+accent             = "#50FA7B"   # 連線狀態等「正常」的顏色
+warning            = "#FFB86C"
+error              = "#FF5555"
+background         = "#282A36"
+surface            = "#343746"   # 選取列的底色（沒寫 selection_background 時）
+sidebar_background = "#14151C"   # 左邊清單的底色
+text               = "#F8F8F2"
+text_muted         = "#6272A4"   # 時間、預覽、提示
+border             = "#44475A"   # 沒有焦點的面板外框
+```
+
+發話者名字的顏色固定用終端機調色盤的八個色號（每個人一個顏色），不跟主題變。
+
+## 分類
+
+清單分區：★ VIP → 自己建的分類（依建立順序）→ 群組 → 一對一。已經是 VIP 的聊天室在
+VIP 區。分區標題顯示未讀總數，收合起來也看得到有沒有人找你。
+
+```
+c            （清單）幫選中的聊天室選分類：選既有的、打字新增、或「不分類」回到自動區
+Ctrl-T       （聊天室裡）同上，對象是開著或正在預覽的那個
+空白鍵        收合／展開游標所在的分區；↑↓ 也會停在分區標題上，標題上按 Enter 一樣
+滑鼠點標題    收合／展開
+```
+
+存在 state 目錄（跟著帳號走）：`categories` 一行一筆「mid<Tab>分類」，`collapsed` 一行
+一個收合的分區。「★ VIP」「群組」「一對一」是保留名稱，不能拿來當分類。
 
 ## 這支程式不碰 LINE
 
@@ -84,6 +120,8 @@ Ctrl-V       貼上：剪貼簿裡的圖片、或在檔案管理員複製的檔�
 Ctrl-F       附加檔案：輸入路徑，Tab 補完
 拖檔案進終端機  附加那個檔案（終端機貼進來的是路徑，TUI 認得）
 Ctrl-B       清單：展開 → 只有名稱 → 隱藏（對話最大化）
+Ctrl-Y       換主題（見下面）
+c／Ctrl-T    分類（見下面）
 g            往前載入更舊的訊息（輸入框空的時候）
 r            重整聊天室清單
 滾輪／PageUp Down  捲動訊息（往上＝回溯較舊的）

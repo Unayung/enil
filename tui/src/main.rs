@@ -8,8 +8,10 @@
 //! 來回一趟，同步做會整個卡住。
 
 mod archive;
+mod categories;
 mod client;
 mod model;
+mod theme;
 
 use crossterm::event::{
     self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
@@ -126,6 +128,48 @@ fn load_vip() -> HashSet<String> {
         .collect()
 }
 
+/// 清單上的一列。
+#[derive(Clone)]
+enum ListRow {
+    Chat(usize),
+    /// 分區標題（分區名稱）。
+    Header(String),
+}
+
+/// 主題選單。游標移到哪個主題，整個畫面就先換成那個（預覽）；Esc 換回 original。
+struct ThemePicker {
+    names: Vec<String>,
+    pick: usize,
+    original: theme::Theme,
+}
+
+/// 分類選單：把某個聊天室放進哪個分類。
+struct CatPrompt {
+    mid: String,
+    name: String,
+    query: String,
+    pick: usize,
+}
+
+/// 分類選單裡的一個選項。
+#[derive(Clone, PartialEq)]
+enum CatChoice {
+    Existing(String),
+    New(String),
+    /// 不分類：回到自動區（群組／一對一）。
+    Clear,
+}
+
+impl CatChoice {
+    fn label(&self) -> String {
+        match self {
+            CatChoice::Existing(n) => n.clone(),
+            CatChoice::New(n) => format!("＋ 新增「{n}」"),
+            CatChoice::Clear => "（不分類）".into(),
+        }
+    }
+}
+
 struct App {
     chats: Vec<Chat>,
     selected: usize,
@@ -197,10 +241,20 @@ struct App {
     /// VIP 聊天室的 mid。置頂、通知不會自己消失、未讀永遠顯示在狀態列。存在 state 目錄的
     /// `vip` 檔（一行一個 mid）—— state 目錄是跟著帳號走的，mid 也是。
     vip: HashSet<String>,
-    theme: Theme,
+    theme: theme::Theme,
     tx: Sender<Update>,
     // 上次繪製的版面。滑鼠事件只有座標，要靠這個判斷點到哪一區。
     list_area: Rect,
+    /// 上次畫出來的清單每一列在哪、是什麼（聊天室或分區標題）。滑鼠靠它對回去。
+    list_rows: Vec<(Rect, ListRow)>,
+    /// 分類（自己分的）與收合狀態。
+    cats: categories::Categories,
+    /// 分類選單（c／Ctrl-T）。None 是沒開。
+    cat_prompt: Option<CatPrompt>,
+    /// 主題選單（Ctrl-Y）。
+    theme_picker: Option<ThemePicker>,
+    /// 清單游標停在某個分區標題上（那一區的名稱）。這時 selected 不變，Enter／空白鍵切換收合。
+    on_header: Option<String>,
     msg_area: Rect,
     list_offset: usize,
     /// 上次畫出來的每則訊息佔哪一塊（區域、msgs 索引）。點擊要靠它對回訊息。
@@ -217,11 +271,6 @@ struct App {
 }
 
 impl App {
-    /// 清單裡一個聊天室佔幾列。滑鼠座標換算成第幾筆要用。
-    fn list_item_rows(&self) -> u16 {
-        if self.sidebar == Sidebar::Names && !self.narrow { 1 } else { 2 }
-    }
-
     fn spawn<F>(&self, f: F)
     where
         F: FnOnce() -> Update + Send + 'static,
@@ -252,15 +301,138 @@ impl App {
         });
     }
 
-    /// VIP 排最前面（VIP 之間、其餘之間都還是照最近活動排）。
+    /// 照分區排（VIP → 自己的分類 → 群組 → 一對一），區內維持最近活動的順序。
+    /// 清單畫出來的順序就是 chats 的順序，所以分區一定是連續的。
     /// selected 是索引，排完要指回原本那個聊天室。
-    fn pin_vips(&mut self) {
+    fn sort_sections(&mut self) {
         let selected = self.chats.get(self.selected).map(|c| c.mid.clone());
-        let vip = &self.vip;
-        self.chats.sort_by_key(|c| !vip.contains(&c.mid)); // 穩定排序，組內順序不變
+        let (vip, cats) = (&self.vip, &self.cats);
+        self.chats.sort_by_key(|c| cats.section(&c.mid, vip.contains(&c.mid)).1); // 穩定排序
         if let Some(i) = selected.and_then(|mid| self.chats.iter().position(|c| c.mid == mid)) {
             self.selected = i;
         }
+    }
+
+    fn section_of(&self, i: usize) -> String {
+        self.chats.get(i).map_or_else(String::new, |c| self.cats.section(&c.mid, self.vip.contains(&c.mid)).0)
+    }
+
+    /// 收合的分區裡的聊天室不在清單上，游標也跳過它們。
+    fn visible(&self, i: usize) -> bool {
+        !self.cats.collapsed.contains(&self.section_of(i))
+    }
+
+    /// 清單上看得到的列，依畫面順序：每區一個標題，收合的區只有標題。
+    fn visible_rows(&self) -> Vec<ListRow> {
+        let mut out = Vec::new();
+        let mut last: Option<String> = None;
+        for i in 0..self.chats.len() {
+            let section = self.section_of(i);
+            if last.as_ref() != Some(&section) {
+                out.push(ListRow::Header(section.clone()));
+                last = Some(section.clone());
+            }
+            if !self.cats.collapsed.contains(&section) {
+                out.push(ListRow::Chat(i));
+            }
+        }
+        out
+    }
+
+    /// 清單游標往上（-1）或往下（+1）一列，標題也停。
+    fn move_selection(&mut self, delta: i32) {
+        let rows = self.visible_rows();
+        let here = rows.iter().position(|r| match (r, &self.on_header) {
+            (ListRow::Header(h), Some(on)) => h == on,
+            (ListRow::Chat(i), None) => *i == self.selected,
+            _ => false,
+        });
+        let next = match (here, delta < 0) {
+            (Some(h), true) => h.checked_sub(1),
+            (Some(h), false) => Some(h + 1),
+            // 游標所在的聊天室看不見（例如剛被收起來）：從頭或尾找。
+            (None, true) => rows.len().checked_sub(1),
+            (None, false) => Some(0),
+        };
+        match next.and_then(|n| rows.get(n)) {
+            Some(ListRow::Chat(i)) => {
+                self.selected = *i;
+                self.on_header = None;
+            }
+            Some(ListRow::Header(h)) => self.on_header = Some(h.clone()),
+            None => {}
+        }
+    }
+
+    /// 收合／展開某一區。游標所在的聊天室被收起來時，游標停到那一區的標題上 ——
+    /// 再按一次就展開回來，不會跳到別的地方去。
+    fn toggle_section(&mut self, section: &str) {
+        if let Err(e) = self.cats.toggle_collapsed(section) {
+            self.status = format!("收合狀態存不了：{e}");
+        }
+        if self.on_header.is_none() && !self.visible(self.selected) {
+            self.on_header = Some(section.to_string());
+        }
+    }
+
+    /// 空白鍵（或在標題上按 Enter）：切換游標所在那一區。
+    fn toggle_current_section(&mut self) {
+        let section = self.on_header.clone().unwrap_or_else(|| self.section_of(self.selected));
+        self.toggle_section(&section);
+    }
+
+    /// c／Ctrl-T：幫畫面上的那個聊天室（預覽中的、開著的，或清單選中的）選分類。
+    fn start_cat_prompt(&mut self) {
+        let target = match (self.peeking(), &self.open) {
+            (Some(c), _) => Some((c.mid.clone(), c.name.clone())),
+            (None, Some(mid)) => Some((mid.clone(), self.open_name.clone())),
+            (None, None) => self.chats.get(self.selected).map(|c| (c.mid.clone(), c.name.clone())),
+        };
+        if let Some((mid, name)) = target {
+            self.cat_prompt = Some(CatPrompt { mid, name, query: String::new(), pick: 0 });
+        }
+    }
+
+    /// 分類選單目前的選項：符合關鍵字的既有分類、打了新名字就多一個「新增」、已經有分類就多一個「不分類」。
+    fn cat_choices(&self) -> Vec<CatChoice> {
+        let Some(p) = &self.cat_prompt else { return vec![] };
+        let q = p.query.trim();
+        let mut out: Vec<CatChoice> = self
+            .cats
+            .names()
+            .into_iter()
+            .filter(|n| n.to_lowercase().contains(&q.to_lowercase()))
+            .map(|n| CatChoice::Existing(n.to_string()))
+            .collect();
+        let exists = self.cats.names().iter().any(|n| *n == q);
+        if !q.is_empty() && !exists && !categories::reserved(q) {
+            out.insert(0, CatChoice::New(q.to_string()));
+        }
+        if self.cats.of(&p.mid).is_some() {
+            out.push(CatChoice::Clear);
+        }
+        out
+    }
+
+    fn apply_cat(&mut self, choice: CatChoice) {
+        let Some(p) = self.cat_prompt.take() else { return };
+        let cat = match &choice {
+            CatChoice::Existing(n) | CatChoice::New(n) => Some(n.clone()),
+            CatChoice::Clear => None,
+        };
+        if let Err(e) = self.cats.set(&p.mid, cat.as_deref()) {
+            self.status = format!("分類存不了：{e}");
+            return;
+        }
+        // 放進一個收合的分區：打開它，不然剛分好的聊天室（還可能是游標所在的）就不見了。
+        let section = self.cats.section(&p.mid, self.vip.contains(&p.mid)).0;
+        let _ = self.cats.expand(&section);
+        self.sort_sections();
+        self.status = match cat {
+            Some(c) if self.vip.contains(&p.mid) => format!("{} 放進「{c}」（是 VIP，仍顯示在 VIP 區）", p.name),
+            Some(c) => format!("{} 放進「{c}」", p.name),
+            None => format!("{} 不分類", p.name),
+        };
     }
 
     /// 開著聊天室，但右邊正在預覽清單上選中的另一個。輸入框這時不收字：
@@ -268,7 +440,7 @@ impl App {
     fn peeking(&self) -> Option<&Chat> {
         let open = self.open.as_ref()?;
         let chat = self.chats.get(self.selected)?;
-        (self.peek && !self.narrow && &chat.mid != open).then_some(chat)
+        (self.peek && !self.narrow && self.on_header.is_none() && &chat.mid != open).then_some(chat)
     }
 
     /// Esc：不預覽了，回到開著的那個；清單游標也移回它。
@@ -298,7 +470,7 @@ impl App {
         if let Err(e) = std::fs::write(vip_path(), lines.join("\n") + "\n") {
             self.status = format!("VIP 名單存不了：{e}");
         }
-        self.pin_vips();
+        self.sort_sections();
     }
 
     /// 主迴圈每一輪呼叫：游標停在一個還沒預覽的聊天室上就抓它的訊息。
@@ -432,6 +604,7 @@ impl App {
 
     fn open_chat(&mut self, mid: String, name: String) {
         self.stash_draft();
+        self.on_header = None;
         self.peek = false;
         self.preview = None;
         // 清單游標跟著開的那個走（從搜尋開的也是），不然下一個 ↑↓ 會從奇怪的地方開始。
@@ -784,7 +957,10 @@ impl App {
         // 訊息裡是 \r，在 LINE 上不會換行。
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         let first_line = text.lines().next().unwrap_or("").to_string();
-        if let Some(prompt) = self.path_prompt.as_mut() {
+        if let Some(p) = self.cat_prompt.as_mut() {
+            p.query.push_str(first_line.trim());
+            p.pick = 0;
+        } else if let Some(prompt) = self.path_prompt.as_mut() {
             let joined = format!("{}{}", prompt.text, first_line.trim());
             prompt.set(joined);
         } else if let Some(ms) = self.msg_search.as_mut() {
@@ -812,7 +988,7 @@ impl App {
                 } else if self.selected >= self.chats.len() {
                     self.selected = self.chats.len().saturating_sub(1);
                 }
-                self.pin_vips();
+                self.sort_sections();
                 self.status.clear();
             }
             Update::Downloaded(path) => self.status = system_open(&path),
@@ -883,7 +1059,7 @@ impl App {
                         } else if i > self.selected {
                             self.selected += 1;
                         }
-                        self.pin_vips();
+                        self.sort_sections();
                     }
                     // 不在清單裡（新聊天室，或排在 60 名之外）—— 整個重抓。
                     None => self.load_chats(),
@@ -1141,62 +1317,6 @@ fn fit(s: &str, max: usize) -> String {
     out + "…"
 }
 
-/// 配色。在 omarchy 上讀目前主題的 colors.toml，換主題時跟著換（見 refresh）；
-/// 其他環境沒有那個檔，退回終端機調色盤的色號。
-///
-/// 發話者顏色（sender_color）與調暗一律用調色盤色號，不放在這裡：omarchy 換主題時會
-/// 叫終端機重載調色盤，那些顏色本來就會自己變。這裡只管調色盤裡沒有的語意色。
-struct Theme {
-    /// 強調色：選取、未讀、焦點所在的面板、連結。
-    accent: Color,
-    /// 印在強調色底上的字。
-    on_accent: Color,
-    /// 選取列的底色。沒有主題檔時是 None，只靠色條與粗體標示。
-    selection: Option<Color>,
-    stamp: Option<SystemTime>,
-}
-
-impl Theme {
-    fn path() -> std::path::PathBuf {
-        client::state_dir().with_file_name("omarchy").join("current/theme/colors.toml")
-    }
-
-    fn load() -> Theme {
-        let path = Theme::path();
-        let stamp = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-        let mut theme = parse_theme(&std::fs::read_to_string(&path).unwrap_or_default());
-        theme.stamp = stamp;
-        theme
-    }
-
-    /// 主題檔換了就重讀。omarchy 換主題是把整個目錄刪掉再搬新的進來，中間有一瞬間
-    /// 檔案不存在 —— 那時先維持原樣，不要閃回預設色。
-    fn refresh(&mut self) {
-        let stamp = std::fs::metadata(Theme::path()).and_then(|m| m.modified()).ok();
-        if stamp.is_some() && stamp != self.stamp {
-            *self = Theme::load();
-        }
-    }
-}
-
-/// colors.toml 是一行一個 `key = "#rrggbb"`。只取用得到的幾個鍵，不為此拉進 toml。
-fn parse_theme(raw: &str) -> Theme {
-    let get = |key: &str| {
-        raw.lines().find_map(|l| {
-            let (k, v) = l.split_once('=')?;
-            let hex = v.trim().trim_matches('"').strip_prefix('#')?;
-            let n = u32::from_str_radix(hex, 16).ok().filter(|_| hex.len() == 6)?;
-            (k.trim() == key).then(|| Color::Rgb((n >> 16) as u8, (n >> 8) as u8, n as u8))
-        })
-    };
-    Theme {
-        accent: get("accent").or_else(|| get("color4")).unwrap_or(Color::Green),
-        on_accent: get("background").unwrap_or(Color::Black),
-        selection: get("selection"),
-        stamp: None,
-    }
-}
-
 /// 把網址標成底線＋強調色，看得出哪裡點得開。
 fn rich(text: &str, accent: Color) -> Text<'static> {
     let link = Style::new().fg(accent).add_modifier(Modifier::UNDERLINED);
@@ -1275,15 +1395,46 @@ fn draw_avatar(
     }
 }
 
+thread_local! {
+    /// 這一幀的主題配色。dim()／pane() 是到處都在用的小函式，不想每個呼叫都多帶一個參數，
+    /// 所以 draw() 開頭設一次。
+    static PALETTE: std::cell::RefCell<Option<theme::Theme>> = const { std::cell::RefCell::new(None) };
+}
+
+fn palette<T>(f: impl FnOnce(&theme::Theme) -> T) -> Option<T> {
+    PALETTE.with(|p| p.borrow().as_ref().map(f))
+}
+
+/// 次要文字。主題有給次要文字的顏色就用它，否則用終端機的「暗淡」效果。
 fn dim() -> Style {
-    Style::new().add_modifier(Modifier::DIM)
+    match palette(|t| t.muted).flatten() {
+        Some(c) => Style::new().fg(c),
+        None => Style::new().add_modifier(Modifier::DIM),
+    }
+}
+
+/// 主題的底色與文字色（沒設就是終端機自己的）。浮層 Clear 之後要靠它把底色補回來。
+fn base() -> Style {
+    let mut s = Style::new();
+    if let Some(bg) = palette(|t| t.bg).flatten() {
+        s = s.bg(bg);
+    }
+    if let Some(fg) = palette(|t| t.text).flatten() {
+        s = s.fg(fg);
+    }
+    s
 }
 
 /// 面板外框：圓角，焦點所在的那個用強調色。
 fn pane(title: Line<'static>, active: bool, accent: Color) -> Block<'static> {
     Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(if active { Style::new().fg(accent) } else { dim() })
+        .border_style(match (active, palette(|t| t.border).flatten()) {
+            (true, _) => Style::new().fg(accent),
+            (false, Some(c)) => Style::new().fg(c),
+            (false, None) => dim(),
+        })
+        .style(base())
         .title(title)
 }
 
@@ -1302,6 +1453,11 @@ fn now_ms() -> i64 {
 }
 
 fn draw(f: &mut Frame, app: &mut App) {
+    PALETTE.with(|p| *p.borrow_mut() = Some(app.theme.clone()));
+    // 主題有底色就先鋪滿整個畫面；沒有（終端機主題）就什麼都不畫，用終端機自己的背景。
+    if app.theme.bg.is_some() {
+        f.render_widget(Block::new().style(base()), f.area());
+    }
     // 上面左右兩欄（清單｜訊息＋輸入列），最底下一整條狀態列。
     let rows = Layout::vertical([Constraint::Min(4), Constraint::Length(1)]).split(f.area());
     let in_chat = app.open.is_some();
@@ -1325,17 +1481,52 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     // ---------------------------------------------------------------- 聊天室清單
     // 兩行一筆：名稱＋時間，底下預覽＋未讀徽章。收窄時一行一筆：名稱＋未讀徽章。
-    // 滑鼠點擊靠 list_item_rows() 換算，改行數要一起改那裡。
+    // 分區之間插一列標題；收合的分區只剩標題。每一列是什麼記在 rows（滑鼠與大頭貼用）。
     let list_w = cols[0].width.saturating_sub(2) as usize;
     // 展開時每筆左邊留給大頭貼的寬度（收窄時只有名稱，不畫）。
     let lead = if compact { 0 } else { AVATAR_W as usize };
     let today = model::day_index(now_ms());
-    let items: Vec<ListItem> = app
-        .chats
-        .iter()
-        .enumerate()
-        .map(|(idx, c)| {
-            let selected = idx == app.selected;
+    // 每個分區的未讀總數（標題上顯示；收合起來也看得到有沒有人找你）。
+    let mut section_unread: HashMap<String, i64> = HashMap::new();
+    for i in 0..app.chats.len() {
+        *section_unread.entry(app.section_of(i)).or_default() += app.chats[i].unread.max(0);
+    }
+    let mut layout: Vec<(u16, ListRow)> = Vec::new();
+    let mut items: Vec<ListItem> = Vec::new();
+    let mut last_section: Option<String> = None;
+    for idx in 0..app.chats.len() {
+        let section = app.section_of(idx);
+        let collapsed = app.cats.collapsed.contains(&section);
+        if last_section.as_ref() != Some(&section) {
+            last_section = Some(section.clone());
+            let unread = section_unread.get(&section).copied().unwrap_or(0);
+            let count = if unread > 0 { format!(" {unread} ") } else { String::new() };
+            let on = app.on_header.as_ref() == Some(&section);
+            let head = format!("{} {}", if collapsed { "▸" } else { "▾" }, section);
+            let head = fit(&head, list_w.saturating_sub(1 + count.width()));
+            let pad = list_w.saturating_sub(head.width() + count.width());
+            items.push(
+                ListItem::new(Line::from(vec![
+                    Span::styled(head, Style::new().fg(accent).add_modifier(Modifier::BOLD)),
+                    Span::raw(" ".repeat(pad)),
+                    Span::styled(count, Style::new().fg(on_accent).bg(accent).add_modifier(Modifier::BOLD)),
+                ]))
+                // 游標停在標題上：整列反白（沒有主題的選取色時也看得出來）。
+                .style(match (on, selection) {
+                    (true, Some(bg)) => Style::new().bg(bg),
+                    (true, None) => Style::new().add_modifier(Modifier::REVERSED),
+                    _ => Style::new(),
+                }),
+            );
+            layout.push((1, ListRow::Header(section.clone())));
+        }
+        if collapsed {
+            continue;
+        }
+        let c = &app.chats[idx];
+        layout.push((if compact { 1 } else { 2 }, ListRow::Chat(idx)));
+        items.push({
+            let selected = idx == app.selected && app.on_header.is_none();
             let bar = if selected {
                 Span::styled("▌", Style::new().fg(accent))
             } else {
@@ -1372,7 +1563,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             if compact {
                 let name = fit(&label, list_w.saturating_sub(3 + badge.width()));
                 let pad = list_w.saturating_sub(2 + name.width() + badge.width());
-                return ListItem::new(Line::from(vec![
+                ListItem::new(Line::from(vec![
                     bar,
                     Span::raw(" "),
                     Span::styled(name, name_style),
@@ -1385,9 +1576,8 @@ fn draw(f: &mut Frame, app: &mut App) {
                 .style(match selection {
                     Some(bg) if selected => Style::new().bg(bg),
                     _ => Style::new(),
-                });
-            }
-
+                })
+            } else {
             ListItem::new(vec![
                 Line::from(vec![
                     bar.clone(),
@@ -1412,8 +1602,9 @@ fn draw(f: &mut Frame, app: &mut App) {
                 Some(bg) if selected => Style::new().bg(bg),
                 _ => Style::new(),
             })
-        })
-        .collect();
+            }
+        });
+    }
 
     app.list_area = cols[0];
     app.msg_area = right[0];
@@ -1425,26 +1616,45 @@ fn draw(f: &mut Frame, app: &mut App) {
         list_title.push(Span::styled(label, Style::new().fg(accent)));
     }
     let mut list_state = ListState::default();
-    list_state.select(Some(app.selected));
+    // ListState 的索引是「列」（含分區標題），不是 chats 的索引。
+    list_state.select(layout.iter().position(|(_, r)| match (r, &app.on_header) {
+        (ListRow::Header(h), Some(on)) => h == on,
+        (ListRow::Chat(i), None) => *i == app.selected,
+        _ => false,
+    }));
     *list_state.offset_mut() = app.list_offset;
     f.render_stateful_widget(
-        List::new(items).block(pane(Line::from(list_title), !in_chat, accent)),
+        List::new(items).block({
+            // 側欄的底色跟訊息區分開（主題有給的話）。
+            let block = pane(Line::from(list_title), !in_chat, accent);
+            match app.theme.sidebar_bg {
+                Some(bg) => block.style(base().bg(bg)),
+                None => block,
+            }
+        }),
         cols[0],
         &mut list_state,
     );
     // ratatui 會依選取項調整 offset，記回來給滑鼠換算用。
     app.list_offset = list_state.offset();
 
-    // 大頭貼疊在清單上：圖片要自己的 Rect，塞不進 ListItem，所以清單先留空格、
-    // 畫完再照「兩行一筆」算出每筆的位置把圖放上去。
+    // 從捲動的位置開始，算出每一列在畫面上的位置：滑鼠點擊與大頭貼都用它。
+    let inner = cols[0].inner(Margin::new(1, 1));
+    app.list_rows.clear();
+    let mut y = inner.y;
+    for (h, row) in layout.into_iter().skip(app.list_offset) {
+        if y + h > inner.bottom() {
+            break;
+        }
+        app.list_rows.push((Rect { y, height: h, ..inner }, row));
+        y += h;
+    }
+    // 大頭貼疊在清單上：圖片要自己的 Rect，塞不進 ListItem，所以清單先留空格、畫完再放上去。
     if !compact {
-        let inner = cols[0].inner(Margin::new(1, 1));
-        for (row, c) in app.chats.iter().skip(app.list_offset).enumerate() {
-            let y = inner.y + row as u16 * 2;
-            if y + 2 > inner.bottom() {
-                break;
-            }
-            let slot = Rect { x: inner.x + 1, y, width: AVATAR_W, height: 2 }.intersection(inner);
+        for (r, row) in app.list_rows.clone() {
+            let ListRow::Chat(i) = row else { continue };
+            let c = &app.chats[i];
+            let slot = Rect { x: inner.x + 1, y: r.y, width: AVATAR_W, height: 2 }.intersection(inner);
             draw_avatar(
                 f, &mut app.avatars, &app.picker, slot,
                 &c.mid, c.avatar_path.as_deref(), &c.name, sender_color(&c.name), on_accent,
@@ -1778,7 +1988,11 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     // ---------------------------------------------------------------- 狀態列
     // 左：模式標籤＋目前聊天室＋按鍵提示（或狀態訊息）。右：跟 daemon 的連線。
-    let (mode, hints) = if app.path_prompt.is_some() {
+    let (mode, hints) = if app.theme_picker.is_some() {
+        ("主題", keys(&[("↑↓", "預覽"), ("Enter", "套用"), ("Esc", "還原")]))
+    } else if app.cat_prompt.is_some() {
+        ("分類", keys(&[("↑↓", "選擇"), ("Enter", "確定"), ("Esc", "取消")]))
+    } else if app.path_prompt.is_some() {
         ("附檔", keys(&[("Tab", "補完"), ("Enter", "附加"), ("Esc", "取消")]))
     } else if app.search.as_ref().is_some_and(|s| s.forward.is_some()) {
         ("轉傳", keys(&[("↑↓", "選擇"), ("Enter", "送過去"), ("Esc", "取消")]))
@@ -1814,10 +2028,10 @@ fn draw(f: &mut Frame, app: &mut App) {
     if app.status.is_empty() {
         left.extend(hints.spans);
     } else {
-        left.push(Span::styled(app.status.clone(), Style::new().fg(Color::Yellow)));
+        left.push(Span::styled(app.status.clone(), Style::new().fg(app.theme.warning)));
     }
     f.render_widget(Paragraph::new(Line::from(left)), rows[1]);
-    let (dot, label) = if app.online { (Color::Green, "已連線") } else { (Color::Red, "離線") };
+    let (dot, label) = if app.online { (app.theme.ok, "已連線") } else { (app.theme.error, "離線") };
     let link = Line::from(vec![
         Span::styled(" ●", Style::new().fg(dot)),
         Span::styled(if tight { " ".to_string() } else { format!(" {label} ") }, dim()),
@@ -2028,6 +2242,75 @@ fn draw_overlays(f: &mut Frame, app: &App) {
         }
     }
 
+    if let Some(tp) = &app.theme_picker {
+        let height = (tp.names.len() as u16 + 2).min(f.area().height.saturating_sub(2)).max(5);
+        let area = centered(f.area(), 44, height);
+        f.render_widget(Clear, area);
+        let block = pane(Line::from(Span::styled(" 主題 ", bold)), true, accent)
+            .title_bottom(Line::from(" ↑↓ 預覽   Enter 套用   Esc 還原 ").right_aligned());
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let rows = inner.height as usize;
+        let start = (tp.pick + 1).saturating_sub(rows);
+        let lines: Vec<Line> = tp
+            .names
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(rows)
+            .map(|(i, n)| {
+                let picked = i == tp.pick;
+                let note = match n.as_str() {
+                    theme::OMARCHY => "  跟著系統主題",
+                    theme::TERMINAL => "  用終端機的配色",
+                    _ => "",
+                };
+                let line = Line::from(vec![
+                    Span::styled(if picked { "▌ " } else { "  " }, Style::new().fg(accent)),
+                    Span::styled(n.clone(), if picked { bold.fg(accent) } else { Style::new() }),
+                    Span::styled(note, dim()),
+                ]);
+                match app.theme.selection {
+                    Some(bg) if picked => line.style(Style::new().bg(bg)),
+                    _ => line,
+                }
+            })
+            .collect();
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
+    if let Some(p) = &app.cat_prompt {
+        let choices = app.cat_choices();
+        let area = centered(f.area(), 48, (choices.len() as u16 + 4).clamp(6, 16));
+        f.render_widget(Clear, area);
+        let block = pane(Line::from(Span::styled(format!(" {} 的分類 ", fit(&p.name, 24)), bold)), true, accent)
+            .title_bottom(Line::from(" 打字篩選或新增   Enter 確定   Esc 取消 ").right_aligned());
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        if inner.height >= 2 && inner.width > 4 {
+            let now = app.cats.of(&p.mid).map(String::from);
+            let mut lines = vec![Line::from(vec![Span::styled("› ", Style::new().fg(accent)), Span::raw(p.query.clone())])];
+            if choices.is_empty() {
+                lines.push(Line::from(Span::styled("  打一個名字來建立第一個分類", dim())));
+            }
+            for (i, c) in choices.iter().enumerate().take(inner.height as usize - 1) {
+                let picked = i == p.pick;
+                let mark = if matches!(c, CatChoice::Existing(n) if Some(n) == now.as_ref()) { "  ✓" } else { "" };
+                let line = Line::from(vec![
+                    Span::styled(if picked { "▌ " } else { "  " }, Style::new().fg(accent)),
+                    Span::styled(c.label(), if picked { bold.fg(accent) } else { Style::new() }),
+                    Span::styled(mark, dim()),
+                ]);
+                lines.push(match app.theme.selection {
+                    Some(bg) if picked => line.style(Style::new().bg(bg)),
+                    _ => line,
+                });
+            }
+            f.render_widget(Paragraph::new(lines), inner);
+            f.set_cursor_position((inner.x + 2 + p.query.width() as u16, inner.y));
+        }
+    }
+
     if let Some(prompt) = &app.path_prompt {
         let area = centered(f.area(), 72, 14);
         f.render_widget(Clear, area);
@@ -2073,6 +2356,8 @@ fn draw_overlays(f: &mut Frame, app: &App) {
                 ("/", "搜尋全部聊天室"),
                 ("Ctrl-S", "搜尋訊息內容（本機存檔，比兩週更早的也找得到）"),
                 ("r", "重整清單"),
+                ("c", "幫選中的聊天室選分類（聊天室裡用 Ctrl-T）"),
+                ("空白鍵", "收合／展開游標所在的分區"),
                 ("q", "離開"),
             ]),
             ("對話", &[
@@ -2100,6 +2385,7 @@ fn draw_overlays(f: &mut Frame, app: &App) {
             ]),
             ("任何時候", &[
                 ("Ctrl-B", "清單：展開 → 只有名稱 → 隱藏"),
+                ("Ctrl-Y", "換主題（Omarchy、終端機、內建、自訂）"),
                 ("? 或 F1", "這個說明（聊天時 ? 是字，用 F1）；j/k 捲動"),
                 ("Ctrl-C", "離開"),
             ]),
@@ -2187,7 +2473,8 @@ fn login_screen(
     term: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     picker: &Picker,
 ) -> std::io::Result<Option<String>> {
-    let theme = Theme::load();
+    let theme = theme::Theme::load(&theme::saved_choice());
+    PALETTE.with(|p| *p.borrow_mut() = Some(theme.clone()));
     let bold = Style::new().add_modifier(Modifier::BOLD);
     let mut state = Value::Null;
     let mut asked: Option<Instant> = None;
@@ -2231,7 +2518,7 @@ fn login_screen(
             "" => vec![Line::from("連不上 daemon（systemctl --user start enil）")],
             // idle：沒有可用的憑證；error：上一次登入失敗。
             _ => vec![
-                Line::from(Span::styled(field("error"), Style::new().fg(Color::Yellow))),
+                Line::from(Span::styled(field("error"), Style::new().fg(theme.warning))),
                 Line::from(vec![Span::styled("Enter", bold), Span::raw(" 產生登入用的 QR")]),
             ],
         };
@@ -2465,11 +2752,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         help_max: std::cell::Cell::new(0),
         attach: None,
         path_prompt: None,
-        theme: Theme::load(),
+        theme: theme::Theme::load(&theme::saved_choice()),
         tx,
         list_area: Rect::default(),
         msg_area: Rect::default(),
         list_offset: 0,
+        list_rows: vec![],
+        cats: categories::Categories::load(&client::state_dir()),
+        cat_prompt: None,
+        theme_picker: None,
+        on_header: None,
         msg_rects: vec![],
         cursor: None,
         picker,
@@ -2587,7 +2879,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         // 浮層開著時滑鼠不作用，免得點穿到底下的清單。
-        if matches!(ev, Event::Mouse(_)) && (app.help || app.search.is_some() || app.msg_search.is_some() || app.path_prompt.is_some() || app.react_picker || app.mention.is_some()) {
+        if matches!(ev, Event::Mouse(_)) && (app.help || app.search.is_some() || app.msg_search.is_some() || app.path_prompt.is_some() || app.react_picker || app.mention.is_some() || app.cat_prompt.is_some() || app.theme_picker.is_some()) {
             continue;
         }
         if let Event::Mouse(m) = ev {
@@ -2600,10 +2892,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let over_msg = app.msg_rects.iter().any(|(r, i)| {
                         r.contains(Position::new(col, row)) && app.msgs[*i].openable()
                     });
-                    let over_chat = in_list
-                        && row > app.list_area.y
-                        && app.list_offset + usize::from((row - app.list_area.y - 1) / app.list_item_rows())
-                            < app.chats.len();
+                    let over_chat = in_list && app.list_rows.iter().any(|(r, _)| r.contains(Position::new(col, row)));
                     let now = over_msg || over_chat;
                     if now != hand {
                         hand = now;
@@ -2611,14 +2900,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 MouseEventKind::Down(MouseButton::Left) if in_list => {
-                    // 清單每筆佔兩行（名稱＋預覽），扣掉上框線再換算。
-                    let inner_top = app.list_area.y + 1;
-                    if row >= inner_top {
-                        let idx = app.list_offset + ((row - inner_top) / app.list_item_rows()) as usize;
-                        if idx < app.chats.len() {
-                            app.selected = idx;
+                    let hit = app.list_rows.iter().find(|(r, _)| r.contains(Position::new(col, row))).map(|(_, t)| t.clone());
+                    match hit {
+                        Some(ListRow::Chat(i)) => {
+                            app.selected = i;
+                            app.on_header = None;
                             app.open_selected();
                         }
+                        Some(ListRow::Header(section)) => app.toggle_section(&section),
+                        None => {}
                     }
                 }
                 // 點訊息：選中它；點得開的（↗）就直接開。跟面板「點下去」同一個行為。
@@ -2641,13 +2931,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 MouseEventKind::ScrollDown if in_msgs => app.scroll = app.scroll.saturating_sub(3),
                 MouseEventKind::ScrollUp if in_list => {
-                    app.selected = app.selected.saturating_sub(1);
+                    app.move_selection(-1);
                     app.peek = app.open.is_some();
                 }
                 MouseEventKind::ScrollDown if in_list => {
-                    if app.selected + 1 < app.chats.len() {
-                        app.selected += 1;
-                    }
+                    app.move_selection(1);
                     app.peek = app.open.is_some();
                 }
                 _ => {}
@@ -2663,6 +2951,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             break Ok(());
+        }
+        // 主題選單開著時，按鍵全部歸它。
+        if let Some(tp) = app.theme_picker.as_mut() {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => tp.pick = tp.pick.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') if tp.pick + 1 < tp.names.len() => tp.pick += 1,
+                KeyCode::Enter => {
+                    let name = tp.names[tp.pick].clone();
+                    app.theme_picker = None;
+                    app.status = match theme::save_choice(&name) {
+                        Ok(()) => format!("主題：{name}"),
+                        Err(e) => format!("主題存不了：{e}"),
+                    };
+                    continue;
+                }
+                KeyCode::Esc => {
+                    app.theme = tp.original.clone();
+                    app.theme_picker = None;
+                    continue;
+                }
+                _ => {}
+            }
+            // 預覽：游標所在的主題直接套到整個畫面。
+            if let Some(tp) = &app.theme_picker {
+                app.theme = theme::Theme::load(&tp.names[tp.pick]);
+            }
+            continue;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('y') {
+            let names = theme::all_names();
+            let pick = names.iter().position(|n| *n == app.theme.name).unwrap_or(0);
+            app.theme_picker = Some(ThemePicker { names, pick, original: app.theme.clone() });
+            continue;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('b') {
             app.sidebar = match app.sidebar {
@@ -2815,6 +3136,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         // 路徑輸入框開著時，按鍵全部歸它。
+        // 分類選單開著時，按鍵全部歸它。
+        if app.cat_prompt.is_some() {
+            let choices = app.cat_choices();
+            let Some(p) = app.cat_prompt.as_mut() else { continue };
+            match key.code {
+                KeyCode::Esc => app.cat_prompt = None,
+                KeyCode::Up => p.pick = p.pick.saturating_sub(1),
+                KeyCode::Down if p.pick + 1 < choices.len() => p.pick += 1,
+                KeyCode::Backspace => {
+                    p.query.pop();
+                    p.pick = 0;
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    p.query.push(c);
+                    p.pick = 0;
+                }
+                KeyCode::Enter => {
+                    if let Some(choice) = choices.get(p.pick).cloned() {
+                        app.apply_cat(choice);
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
         if let Some(prompt) = app.path_prompt.as_mut() {
             match key.code {
                 KeyCode::Esc => app.path_prompt = None,
@@ -2852,8 +3198,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match key.code {
                 KeyCode::Enter => app.open_selected(),
                 KeyCode::Esc => app.end_peek(),
-                KeyCode::Up => app.selected = app.selected.saturating_sub(1),
-                KeyCode::Down if app.selected + 1 < app.chats.len() => app.selected += 1,
+                KeyCode::Up => app.move_selection(-1),
+                KeyCode::Down => app.move_selection(1),
+                KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => app.start_cat_prompt(),
                 KeyCode::Char(_) => app.status = "預覽中：Enter 進入，Esc 回到原本的聊天室".into(),
                 _ => {}
             }
@@ -2869,6 +3216,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let mut prompt = PathPrompt::default();
                     prompt.set("~/".into());
                     app.path_prompt = Some(prompt);
+                    continue;
+                }
+                KeyCode::Char('t') => {
+                    app.start_cat_prompt();
                     continue;
                 }
                 // 終端機慣用的編輯鍵。沒攔下來的話，Ctrl-A 會把「a」打進輸入框。
@@ -2888,6 +3239,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         match key.code {
             // 輸入框有字時 Enter 永遠是送出，不管有沒有選中訊息 —— 打到一半的字不能被吃掉。
+            KeyCode::Enter if app.on_header.is_some() && app.input.is_empty() && app.attach.is_none() => {
+                app.toggle_current_section();
+            }
             KeyCode::Enter => {
                 if app.open.is_some() && (!app.input.is_empty() || app.attach.is_some()) {
                     app.send_input();
@@ -2920,13 +3274,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 edit(&mut app.input, &mut app.caret, op);
             }
             KeyCode::Up => {
-                app.selected = app.selected.saturating_sub(1);
+                app.move_selection(-1);
                 app.peek = app.open.is_some();
             }
             KeyCode::Down => {
-                if app.selected + 1 < app.chats.len() {
-                    app.selected += 1;
-                }
+                app.move_selection(1);
                 app.peek = app.open.is_some();
             }
             KeyCode::PageUp => {
@@ -2965,12 +3317,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // q 之類的鍵就全部被吃進一個看不見的輸入框。
                 if app.open.is_none() {
                     match c {
-                        'j' => {
-                            if app.selected + 1 < app.chats.len() {
-                                app.selected += 1;
-                            }
-                        }
-                        'k' => app.selected = app.selected.saturating_sub(1),
+                        'j' => app.move_selection(1),
+                        'k' => app.move_selection(-1),
+                        // 空白鍵：收合／展開游標所在的分區。
+                        ' ' => app.toggle_current_section(),
+                        'c' => app.start_cat_prompt(),
                         'r' => app.load_chats(),
                         '/' => app.start_search(),
                         '?' => {
@@ -3002,19 +3353,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn theme_from_colors_toml() {
-        let t = parse_theme("accent = \"#e68e0d\"\nselection = \"#333333\"\n\nbackground = \"#000000\"\ncolor4 = \"#112233\"\n");
-        assert_eq!(t.accent, Color::Rgb(0xe6, 0x8e, 0x0d));
-        assert_eq!(t.selection, Some(Color::Rgb(0x33, 0x33, 0x33)));
-        assert_eq!(t.on_accent, Color::Rgb(0, 0, 0));
-        // 沒有 accent 的主題退回 color4；壞掉的值當作沒有。
-        assert_eq!(parse_theme("color4 = \"#112233\"\naccent = \"oops\"").accent, Color::Rgb(0x11, 0x22, 0x33));
-        // 沒有主題檔（不是 omarchy）：用終端機調色盤，沒有選取底色。
-        let none = parse_theme("");
-        assert_eq!((none.accent, none.selection), (Color::Green, None));
-    }
 
     #[test]
     fn links_are_marked() {
