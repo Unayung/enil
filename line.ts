@@ -152,8 +152,8 @@ export function flexOf(json: string): { images: string[]; text: string; links: s
 /** chats() 幫前幾個聊天室準備大頭貼。 */
 const AVATAR_CHATS = 60;
 
-function stickerUrl(id: string): string {
-  return `https://stickershop.line-scdn.net/stickershop/v1/sticker/${id}/android/sticker.png`;
+function stickerUrl(id: string, animated = false): string {
+  return `https://stickershop.line-scdn.net/stickershop/v1/sticker/${id}/android/${animated ? "sticker_animation" : "sticker"}.png`;
 }
 
 /** 訊息 metadata 裡的貼圖參數。三個都要是數字才算，缺一個就送不出一樣的貼圖。 */
@@ -499,9 +499,22 @@ export class Line {
   }
 
   /** 某張貼圖的圖檔（本機路徑），給貼圖選單畫縮圖。跟訊息裡的貼圖走同一個 CDN、同一份快取。 */
-  async stickerImage(id: string): Promise<string> {
+  async stickerImage(id: string): Promise<{ path: string; animated: boolean }> {
     if (!/^\d+$/.test(id)) throw new Error("貼圖 id 要是數字");
-    return await this.#cachePublic(`sticker-${id}.thumb`, stickerUrl(id));
+    // 動態貼圖另外有一個 APNG（sticker.png 只是它的第一格）。先試動畫版，沒有（404）就記一個
+    // .noanim 標記，下次直接用靜態版 —— 靜態貼圖很多，不要每次都多打一個 404。
+    const noAnim = join(MEDIA_DIR, `sticker-${id}.noanim`);
+    if (!existsSync(noAnim)) {
+      try {
+        return { path: await this.#cachePublic(`sticker-${id}.anim`, stickerUrl(id, true)), animated: true };
+      } catch (err) {
+        if (/HTTP 40[34]/.test(String((err as Error)?.message))) {
+          mkdirSync(MEDIA_DIR, { recursive: true });
+          writeFileSync(noAnim, "");
+        }
+      }
+    }
+    return { path: await this.#cachePublic(`sticker-${id}.thumb`, stickerUrl(id)), animated: false };
   }
 
   /** 收回自己的訊息。 */

@@ -53,6 +53,8 @@ enum Update {
     Downloaded(String),
     /// 貼圖選單要的某張貼圖圖檔好了（貼圖 id、路徑）。
     StickerImage(String, String),
+    /// 動態貼圖解好的每一格（貼圖 id、[（圖, 這一格的毫秒數）]）。
+    StickerFrames(String, Vec<(image::DynamicImage, u32)>),
     /// 擁有的貼圖組。
     StickerPacks(Vec<StickerPack>),
     /// 圖片原檔下載並解好了（訊息 id、路徑、圖），給看圖畫面。
@@ -170,6 +172,30 @@ fn parse_packs(v: &Value) -> Vec<StickerPack> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// 解開 APNG 的每一格（已經照 APNG 的規則疊好），回傳（圖, 毫秒）。不是 APNG 或解不開就是 None。
+/// ponytail: 最多取 120 格，太長的動畫後面就不播了；貼圖通常幾十格。
+fn decode_apng(path: &str) -> Option<Vec<(image::DynamicImage, u32)>> {
+    use image::AnimationDecoder;
+    let file = std::io::BufReader::new(std::fs::File::open(path).ok()?);
+    let decoder = image::codecs::png::PngDecoder::new(file).ok()?;
+    if !decoder.is_apng().ok()? {
+        return None;
+    }
+    let frames: Vec<(image::DynamicImage, u32)> = decoder
+        .apng()
+        .ok()?
+        .into_frames()
+        .take(120)
+        .filter_map(Result::ok)
+        .map(|f| {
+            let (n, d) = f.delay().numer_denom_ms();
+            let ms = if d == 0 { 100 } else { (n / d).clamp(20, 2000) };
+            (image::DynamicImage::ImageRgba8(f.into_buffer()), ms)
+        })
+        .collect();
+    (frames.len() > 1).then_some(frames)
 }
 
 /// 貼圖選單每一格的大小（欄, 列）。
@@ -333,6 +359,12 @@ struct App {
     sticker_imgs: HashMap<String, Option<Protocol>>,
     /// 已經跟 daemon 要了、還沒回來的縮圖（畫面每一幀都會檢查，不能重複要）。
     sticker_pending: HashSet<String>,
+    /// 動態貼圖的每一格（原圖）。依貼圖 id。
+    anim_frames: HashMap<String, std::rc::Rc<Vec<(image::DynamicImage, u32)>>>,
+    /// 動態貼圖縮到某個大小後的每一格，依（貼圖 id, 寬, 高）—— 訊息裡和選單裡的大小不同。
+    anim_protos: HashMap<(String, u16, u16), Vec<Protocol>>,
+    /// 動畫的時間原點：每一幀用「現在離它多久」決定畫哪一格。
+    anim_clock: Instant,
     /// 擁有的貼圖組（第一次開選單時跟 daemon 要）。
     packs: Vec<StickerPack>,
     /// 貼圖選單的分頁：0 是「最近」，1.. 是 packs[分頁-1]。
@@ -988,6 +1020,34 @@ impl App {
         }
     }
 
+    /// 動態貼圖現在該畫的那一格，縮到 size。不是動態貼圖（或還沒解好）就是 None。
+    /// 每個大小的每一格只建一次 Protocol；之後每一幀只是挑一格畫。
+    fn anim_frame(&mut self, id: &str, size: Size) -> Option<&Protocol> {
+        let frames = self.anim_frames.get(id)?.clone();
+        let key = (id.to_string(), size.width, size.height);
+        if !self.anim_protos.contains_key(&key) {
+            let protos: Vec<Protocol> = frames
+                .iter()
+                .filter_map(|(img, _)| self.picker.new_protocol(img.clone(), size, Resize::Fit(None)).ok())
+                .collect();
+            if protos.len() != frames.len() {
+                return None;
+            }
+            self.anim_protos.insert(key.clone(), protos);
+        }
+        let total: u32 = frames.iter().map(|(_, d)| *d).sum::<u32>().max(1);
+        let mut t = (self.anim_clock.elapsed().as_millis() % total as u128) as u32;
+        let mut idx = 0;
+        for (i, (_, d)) in frames.iter().enumerate() {
+            if t < *d {
+                idx = i;
+                break;
+            }
+            t -= d;
+        }
+        self.anim_protos.get(&key).and_then(|p| p.get(idx))
+    }
+
     /// 選單目前這一頁的貼圖。
     fn sticker_page(&self) -> &[model::Sticker] {
         match self.sticker_tab {
@@ -1003,7 +1063,16 @@ impl App {
         }
         let id = id.to_string();
         self.spawn(move || match client::sticker_image(&id) {
-            Ok(v) => Update::StickerImage(id, v.get("path").and_then(Value::as_str).unwrap_or("").to_string()),
+            Ok(v) => {
+                let path = v.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+                // 動態貼圖：在這個背景執行緒順便把每一格解開（APNG 解碼要一點時間，不能卡畫面）。
+                if v.get("animated").and_then(Value::as_bool) == Some(true) {
+                    if let Some(frames) = decode_apng(&path) {
+                        return Update::StickerFrames(id, frames);
+                    }
+                }
+                Update::StickerImage(id, path)
+            }
             Err(_) => Update::StickerImage(id, String::new()),
         });
     }
@@ -1242,6 +1311,14 @@ impl App {
                 if self.sticker_pick.is_some() && self.sticker_tab == 0 && self.stickers.is_empty() && !self.packs.is_empty() {
                     self.sticker_tab = 1;
                 }
+            }
+            Update::StickerFrames(id, frames) => {
+                self.sticker_pending.remove(&id);
+                // 選單的靜態縮圖用第一格，動畫另外畫（見 anim_frame）。
+                let first = frames[0].0.clone();
+                let proto = self.picker.new_protocol(first, Size::new(STICKER_CELL.0 - 2, STICKER_CELL.1 - 1), Resize::Fit(None)).ok();
+                self.sticker_imgs.insert(id.clone(), proto);
+                self.anim_frames.insert(id, std::rc::Rc::new(frames));
             }
             Update::StickerImage(id, path) => {
                 self.sticker_pending.remove(&id);
@@ -2080,7 +2157,8 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     app.msg_rects.clear();
     for (s, h) in stack.into_iter().rev() {
-        let m = &app.msgs[s.i];
+        // 複製一份：迴圈裡要更新動畫快取（&mut app），不能一直借著 app.msgs。
+        let m = &app.msgs[s.i].clone();
         let area = Rect { x: inner.x, y, width: inner.width, height: h };
         y += h;
         // 所有東西都夾在這一則分到的區域裡 —— 被截短的訊息不能畫到別人頭上。
@@ -2160,9 +2238,18 @@ fn draw(f: &mut Frame, app: &mut App) {
         if s.img.height > 0 {
             if let Some(y) = whole(cy, s.img.height) {
                 let r = put(Rect { x, y, width: s.img.width, height: s.img.height });
+                // 動態貼圖：跟 daemon 要動畫版，有了就照時間輪播；還沒有就先畫靜態的。
+                let anim = m.sticker.as_ref().map(|st| st.id.clone());
+                if let Some(id) = &anim {
+                    app.want_sticker_image(id);
+                }
+                if let Some(frame) = anim.as_deref().and_then(|id| app.anim_frame(id, r.as_size())) {
+                    f.render_widget(ratatui_image::Image::new(frame), r);
+                } else {
                 match app.images.get_mut(&m.id) {
                     Some(Some(proto)) => f.render_stateful_widget(StatefulImage::default(), r, proto),
                     _ => f.render_widget(Paragraph::new("[圖片讀不到]").style(dim()), r),
+                }
                 }
             }
             cy += s.img.height as i32;
@@ -2593,6 +2680,10 @@ fn draw_overlays(f: &mut Frame, app: &mut App) {
             }
             let img_area = Rect { x: cell.x + 1, y: cell.y, width: cw - 2, height: ch - 1 };
             app.want_sticker_image(&st.id);
+            if let Some(frame) = app.anim_frame(&st.id, img_area.as_size()) {
+                f.render_widget(ratatui_image::Image::new(frame), img_area);
+                continue;
+            }
             match app.sticker_imgs.get(&st.id) {
                 Some(Some(p)) => f.render_widget(ratatui_image::Image::new(p), img_area),
                 Some(None) => f.render_widget(Paragraph::new("[貼圖]").style(dim()), img_area),
@@ -3128,6 +3219,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sticker_pick: None,
         sticker_imgs: HashMap::new(),
         sticker_pending: HashSet::new(),
+        anim_frames: HashMap::new(),
+        anim_protos: HashMap::new(),
+        anim_clock: Instant::now(),
         packs: vec![],
         sticker_tab: 0,
         on_header: None,

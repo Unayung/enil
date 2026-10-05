@@ -207,7 +207,7 @@ const handlers: Record<string, (line: Line, req: any) => Promise<unknown>> = {
   },
   async stickerImage(line, req) {
     if (!req.id) throw new Error("缺 id");
-    return { path: await line.stickerImage(String(req.id)) };
+    return await line.stickerImage(String(req.id)); // { path, animated }
   },
   async stickerPacks(line) {
     return await line.stickerPacks();
