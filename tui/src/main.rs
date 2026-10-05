@@ -938,10 +938,11 @@ impl App {
 
     /// Ctrl-G：開貼圖選單，順便跟 daemon 要還沒有的縮圖。
     fn open_sticker_picker(&mut self) {
-        if self.stickers.is_empty() {
-            self.status = "還沒有貼圖：聊天室裡出現過的貼圖會自動收進來（也可以選中一則貼圖按 s）".into();
+        if self.open.is_none() {
+            self.status = "先打開一個聊天室，再按 Ctrl-G 選貼圖".into();
             return;
         }
+        // 空的也照樣打開：在選單裡說明貼圖從哪裡來，比狀態列一行字容易看到。
         self.sticker_pick = Some(0);
         for st in &self.stickers {
             if self.sticker_imgs.contains_key(&st.id) {
@@ -2498,6 +2499,19 @@ fn draw_overlays(f: &mut Frame, app: &mut App) {
             .title_bottom(Line::from(" 方向鍵選   Enter 送出   Esc 取消 ").right_aligned());
         let inner = block.inner(area);
         f.render_widget(block, area);
+        if app.stickers.is_empty() {
+            let lines = vec![
+                Line::from(""),
+                Line::from(Span::styled("還沒有貼圖", bold)),
+                Line::from(""),
+                Line::from("LINE 不讓這種裝置列出你擁有的貼圖，所以這裡只有"),
+                Line::from("你在 enil 裡看過或送過的貼圖。"),
+                Line::from(""),
+                Line::from("打開幾個有人傳過貼圖的聊天室，那些貼圖就會收進來；"),
+                Line::from("或是 Tab 選中一則貼圖訊息，按 s 送一張一樣的。"),
+            ];
+            f.render_widget(Paragraph::new(lines).alignment(Alignment::Center).wrap(Wrap { trim: false }), inner);
+        }
         let per_row = (inner.width / cw).max(1) as usize;
         let rows = (inner.height / ch).max(1) as usize;
         // 選中的那張永遠看得到：一次一頁，捲到選中那一列。
@@ -3250,7 +3264,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 KeyCode::Right => (pick + 1).min(n.saturating_sub(1)),
                 KeyCode::Up => pick.saturating_sub(per_row),
                 KeyCode::Down => (pick + per_row).min(n.saturating_sub(1)),
-                KeyCode::Enter => {
+                KeyCode::Enter | KeyCode::Char(' ') => {
                     app.sticker_pick = None;
                     if let Some(st) = app.stickers.get(pick).cloned() {
                         app.send_sticker(st);
@@ -3519,6 +3533,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             continue;
         }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('g') {
+            app.end_peek(); // 預覽別的聊天室時：貼圖是送給開著的那個，先回到它
+            app.open_sticker_picker();
+            continue;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('n') {
             app.open_next_unread();
             continue;
@@ -3551,10 +3570,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let mut prompt = PathPrompt::default();
                     prompt.set("~/".into());
                     app.path_prompt = Some(prompt);
-                    continue;
-                }
-                KeyCode::Char('g') => {
-                    app.open_sticker_picker();
                     continue;
                 }
                 KeyCode::Char('t') => {
