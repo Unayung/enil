@@ -589,7 +589,36 @@ export class Line {
       }
     });
     // OpenChat 不走這裡 —— 見 squareMessages()。
-    this.#client.listen({ talk: true });
+    this.#client.listen({ talk: true, signal: this.#stop.signal });
+  }
+
+  /** close() 用來停掉推送。 */
+  #stop = new AbortController();
+  #closed = false;
+
+  /**
+   * 不再使用這個連線：停掉推送，之後它發出的任何訊號都不再轉給呼叫端。
+   * 被踢之後一定要叫 —— 不然舊連線會一直在背景重試、一直報「已登出」，重新登入之後
+   * 這些舊訊號會被當成新連線也被踢了（實際發生過：M5 掃完 QR 13 秒就「又被登出」）。
+   */
+  close(): void {
+    this.#closed = true;
+    this.#stop.abort();
+  }
+
+  /**
+   * 這個連線還有沒有被授權：問伺服器一次（noop，最輕的請求）。只有明確的「未授權」才算
+   * false；網路錯誤之類的不算被踢，回 true。
+   */
+  async alive(): Promise<boolean> {
+    if (this.#closed) return false;
+    try {
+      await this.#base.talk.noop();
+      return true;
+    } catch (err) {
+      const text = JSON.stringify((err as any)?.data ?? {}) + String((err as Error)?.message ?? err);
+      return !/NOT_AUTHORIZED_DEVICE|LOGGED_OUT|AUTHENTICATION_FAILED/.test(text);
+    }
   }
 
   /**
@@ -601,8 +630,9 @@ export class Line {
    * 「連線還在但不再送東西」的卡死 linejs 看不出來，那個靠 daemon 對帳（見 daemon.ts catchUp）。
    */
   onTrouble(cb: (kind: "kicked" | "push-dead", detail: string) => void): void {
-    this.#base.on("end", () => cb("kicked", "NOT_AUTHORIZED_DEVICE"));
+    this.#base.on("end", () => { if (!this.#closed) cb("kicked", "NOT_AUTHORIZED_DEVICE"); });
     this.#base.on("log", ({ type, data }: { type: string; data: any }) => {
+      if (this.#closed) return; // 已經不用的連線：它的錯誤跟現在的登入無關
       if (type === "LegyPusherError_cannot_init") cb("push-dead", String(data?.error?.message ?? data?.error ?? ""));
       else if (type.endsWith("sync error:")) console.warn("推送同步出錯（之後可能不再收到訊息）：", data);
     });

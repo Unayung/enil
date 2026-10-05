@@ -552,9 +552,26 @@ async function catchUp(chats: Chat[]) {
  * 所以不重開，停在「要重新登入」並把原因寫進 state，TUI 的登入畫面會顯示。
  * 可能從兩條路進來（linejs 的 "end"、或沒被接住的 NOT_AUTHORIZED_DEVICE），要能重複呼叫。
  */
+/**
+ * 收到「可能被踢了」的訊號。訊號不一定來自現在這個連線：被踢之後重新登入，舊連線殘留的
+ * 事件、背景連線檢查的錯誤（linejs 沒接住，從 unhandledRejection 冒出來，分不出是哪個連線）
+ * 都可能晚到。所以先拿現在的連線問伺服器一次，真的被拒才算被踢。
+ * from：發出訊號的連線；跟現在的不同就直接忽略。
+ */
+async function onKickSignal(detail: string, from?: Line) {
+  if (!line || (from && from !== line)) return;
+  const current = line;
+  if (await current.alive()) {
+    console.warn("收到登出訊號，但現在的連線仍然有效（是舊連線殘留的），忽略：", detail);
+    return;
+  }
+  if (line === current) onKicked(detail);
+}
+
 function onKicked(detail: string) {
   if (!line && state.login.status !== "ok") return;
   console.error("這台裝置的登入被取消了：", detail);
+  line?.close(); // 停掉舊連線：不然它會一直重試、一直報「已登出」，干擾下一次登入
   line = undefined;
   state.login = {
     status: "idle",
@@ -704,7 +721,12 @@ async function startLogin(force: boolean): Promise<void> {
     line.onMessage((m) => onIncoming(m));
     line.onEvents(onChatEvent);
     line.onAnyOp(tallyOp);
-    line.onTrouble((kind, detail) => kind === "push-dead" ? restart(detail) : onKicked(detail));
+    const session = line;
+    line.onTrouble((kind, detail) => {
+      if (session !== line) return; // 已經被換掉的連線
+      if (kind === "push-dead") restart(detail);
+      else void onKickSignal(detail, session);
+    });
     try {
       mergeChats(await line.chats(50));
     } catch (err) {
@@ -767,7 +789,7 @@ void startLogin(false);
 // 其他沒被接住的錯誤照舊結束 process（Node 的預設行為），讓 systemd 重開。
 process.on("unhandledRejection", (err) => {
   const data = (err as any)?.data;
-  if (data?.code === "NOT_AUTHORIZED_DEVICE") return onKicked(String(data.reason ?? data.code));
+  if (data?.code === "NOT_AUTHORIZED_DEVICE") return void onKickSignal(String(data.reason ?? data.code));
   console.error("未處理的錯誤：", err);
   flushOpStats();
   process.exit(1);
