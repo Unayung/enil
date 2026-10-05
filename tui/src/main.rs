@@ -61,6 +61,8 @@ enum Update {
     AllChats(Vec<Chat>),
     Sent,
     Error(String),
+    /// 只是要在狀態列顯示一句話（不是錯誤）。
+    Status(String),
 }
 
 /// Ctrl-S：搜尋訊息存檔。
@@ -75,6 +77,16 @@ struct Search {
     query: String,
     /// 結果裡選中第幾筆。
     pick: usize,
+    /// 有值＝這是轉傳的目的地選單：Enter 送過去，不開聊天室。
+    forward: Option<Forward>,
+}
+
+/// 要轉傳的東西。
+#[derive(Clone)]
+enum Forward {
+    Text(String),
+    /// 有原檔的訊息（圖片、影片、語音、檔案）：先跟 daemon 下載原檔，再當成檔案送。
+    File { message_id: String },
 }
 
 #[derive(Default)]
@@ -593,6 +605,41 @@ impl App {
         });
     }
 
+    /// f：轉傳選中的訊息。先開聊天室選單，選好才送（見 forward_to）。
+    fn start_forward(&mut self) {
+        let Some(m) = self.cursor.and_then(|i| self.msgs.get(i)) else { return };
+        let item = if m.has_media {
+            Forward::File { message_id: m.id.clone() }
+        } else if m.kind == "NONE" && !m.text.is_empty() {
+            Forward::Text(m.text.clone())
+        } else {
+            // 貼圖、FLEX 卡片要用 LINE 自己的格式重送，daemon 沒有這個指令。
+            self.status = format!("這種訊息（{}）還不能轉傳", m.kind);
+            return;
+        };
+        self.start_search();
+        if let Some(search) = self.search.as_mut() {
+            search.forward = Some(item);
+        }
+    }
+
+    fn forward_to(&mut self, item: Forward, mid: String, name: String) {
+        self.status = format!("轉傳到 {name}…");
+        self.spawn(move || {
+            let sent = match item {
+                Forward::Text(text) => client::send(&mid, &text, serde_json::json!([])).map(|_| ()),
+                Forward::File { message_id } => client::download(&message_id).and_then(|v| {
+                    let path = v.get("path").and_then(Value::as_str).ok_or("daemon 沒回路徑")?.to_string();
+                    client::send_file(&mid, &path).map(|_| ())
+                }),
+            };
+            match sent {
+                Ok(()) => Update::Status(format!("已轉傳到 {name}")),
+                Err(e) => Update::Error(format!("轉傳失敗：{e}")),
+            }
+        });
+    }
+
     fn unsend_selected(&mut self) {
         let Some(m) = self.cursor.and_then(|i| self.msgs.get(i)) else { return };
         if !m.mine {
@@ -868,6 +915,7 @@ impl App {
                 // 自己送的訊息也會從 listen() 回來，但重讀一次不用等那一拍。
                 self.reload_open();
             }
+            Update::Status(text) => self.status = text,
             Update::Error(e) => {
                 self.busy = false;
                 self.status = e;
@@ -1732,12 +1780,14 @@ fn draw(f: &mut Frame, app: &mut App) {
     // 左：模式標籤＋目前聊天室＋按鍵提示（或狀態訊息）。右：跟 daemon 的連線。
     let (mode, hints) = if app.path_prompt.is_some() {
         ("附檔", keys(&[("Tab", "補完"), ("Enter", "附加"), ("Esc", "取消")]))
+    } else if app.search.as_ref().is_some_and(|s| s.forward.is_some()) {
+        ("轉傳", keys(&[("↑↓", "選擇"), ("Enter", "送過去"), ("Esc", "取消")]))
     } else if app.search.is_some() {
         ("搜尋", keys(&[("↑↓", "選擇"), ("Enter", "開啟"), ("Esc", "取消")]))
     } else if peeking.is_some() {
         ("預覽", keys(&[("↑↓", "選擇"), ("Enter", "進入"), ("Esc", "回到這個聊天室")]))
     } else if app.cursor.is_some() {
-        ("選取", keys(&[("r", "表情"), ("d", "收回"), ("Enter", "開啟"), ("Tab", "上一個"), ("Esc", "取消")]))
+        ("選取", keys(&[("r", "表情"), ("f", "轉傳"), ("d", "收回"), ("Enter", "開啟"), ("Tab", "上一個"), ("Esc", "取消")]))
     } else if in_chat {
         if tight {
             // 放不下全部：先給離開這個畫面的鍵，其餘看 F1。
@@ -1832,7 +1882,8 @@ fn draw_overlays(f: &mut Frame, app: &App) {
         let hits = app.search_hits();
         let area = centered(f.area(), 56, 18);
         f.render_widget(Clear, area);
-        let block = pane(Line::from(Span::styled(" 搜尋聊天室 ", bold)), true, accent)
+        let title = if search.forward.is_some() { " 轉傳到… " } else { " 搜尋聊天室 " };
+        let block = pane(Line::from(Span::styled(title, bold)), true, accent)
             .title_bottom(Line::from(format!(" {} 筆 ", hits.len())).right_aligned());
         let inner = block.inner(area);
         f.render_widget(block, area);
@@ -2029,7 +2080,7 @@ fn draw_overlays(f: &mut Frame, app: &App) {
                 ("← →  ^← ^→", "輸入框：移一個字／跳一個詞"),
                 ("Home End", "輸入框：開頭／結尾（也可 Ctrl-A、Ctrl-E）"),
                 ("^W ^U ^K", "刪前一個詞／刪到開頭／刪到結尾"),
-                ("Tab  ⇧Tab", "選訊息（之後 r 表情、d 收回、Enter 開）"),
+                ("Tab  ⇧Tab", "選訊息（之後 r 表情、f 轉傳、d 收回、Enter 開）"),
                 ("PgUp PgDn", "捲動訊息"),
                 ("g", "載入更舊的訊息（輸入框空的時候）"),
                 ("/", "搜尋全部聊天室（輸入框空的時候）"),
@@ -2731,7 +2782,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 KeyCode::Esc => app.search = None,
                 KeyCode::Enter => {
                     let hit = app.search_hits().get(picked).map(|c| (c.mid.clone(), c.name.clone()));
-                    if let Some((mid, name)) = hit {
+                    let forward = app.search.as_ref().and_then(|s| s.forward.clone());
+                    if let (Some((mid, name)), Some(item)) = (hit.clone(), forward) {
+                        app.search = None;
+                        app.forward_to(item, mid, name);
+                    } else if let Some((mid, name)) = hit {
                         app.search = None;
                         // 清單裡有的話游標也移過去，沒有（排在 60 名外）就只開聊天室。
                         if let Some(i) = app.chats.iter().position(|c| c.mid == mid) {
@@ -2896,6 +2951,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 選中一則訊息、輸入框是空的：r 表情、d 收回。
             KeyCode::Char('r') if app.cursor.is_some() && app.input.is_empty() => app.react_picker = true,
             KeyCode::Char('d') if app.cursor.is_some() && app.input.is_empty() => app.unsend_selected(),
+            KeyCode::Char('f') if app.cursor.is_some() && app.input.is_empty() => app.start_forward(),
             // 群組裡打 @：挑人。一對一沒有要提及的對象。
             KeyCode::Char('@')
                 if app.open.as_deref().is_some_and(|c| !c.starts_with('u')) =>
