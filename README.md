@@ -196,6 +196,9 @@ omarchy plugin add https://github.com/Unayung/omarchy-line.git --enable
 | `unsend` | `messageId` | `{unsent:true}`（只能收回自己的，LINE 限 24 小時內） |
 | `react` | `messageId` `type` | `{reacted:true}`。`type`：`NICE` `LOVE` `FUN` `AMAZING` `SAD` `OMG`，`UNDO` 收回自己的回應 |
 | `members` | `chat` | 群組成員 `[{mid,name}]`，不含自己 |
+| `contacts` | — | 好友清單 `[{mid,name}]`，含還沒聊過的人（快取 10 分鐘） |
+| `sendSticker` | `chat` `sticker:{id,pkg,ver}` | `{sent:true}` |
+| `stickerImage` | `id` | 某張貼圖的圖檔 `{path}` |
 | `sendFile` | `chat` `path` | `{oType,e2ee}` |
 | `download` | `messageId` `preview` | `{path}` |
 | `squares` | — | 加入的 OpenChat |

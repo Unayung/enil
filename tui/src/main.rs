@@ -51,6 +51,10 @@ enum Update {
     Members(String, Vec<(String, String)>),
     /// 原檔下載好了，交給系統開。
     Downloaded(String),
+    /// 貼圖選單要的某張貼圖圖檔好了（貼圖 id、路徑）。
+    StickerImage(String, String),
+    /// 圖片原檔下載並解好了（訊息 id、路徑、圖），給看圖畫面。
+    ImageReady(String, String, Box<image::DynamicImage>),
     /// 語音下載好了，播放。
     Play(String),
     /// 推送連線接上／斷了。
@@ -61,6 +65,8 @@ enum Update {
     Session(bool),
     /// 全部的聊天室（搜尋用；平常的清單只有最近 60 個）。
     AllChats(Vec<Chat>),
+    /// 好友清單：還沒聊過的人也在裡面（搜尋時用來開新對話）。
+    Contacts(Vec<Chat>),
     Sent,
     Error(String),
     /// 只是要在狀態列顯示一句話（不是錯誤）。
@@ -87,6 +93,7 @@ struct Search {
 #[derive(Clone)]
 enum Forward {
     Text(String),
+    Sticker(model::Sticker),
     /// 有原檔的訊息（圖片、影片、語音、檔案）：先跟 daemon 下載原檔，再當成檔案送。
     File { message_id: String },
 }
@@ -134,6 +141,38 @@ enum ListRow {
     Chat(usize),
     /// 分區標題（分區名稱）。
     Header(String),
+}
+
+/// 貼圖選單每一格的大小（欄, 列）。
+const STICKER_CELL: (u16, u16) = (12, 6);
+
+/// 貼圖選單最多記幾張。
+const STICKERS_MAX: usize = 48;
+
+fn stickers_path() -> std::path::PathBuf {
+    client::state_dir().join("stickers")
+}
+
+/// stickers 檔：一行一張「id<Tab>貼圖組<Tab>版本」，最近的在前。
+fn load_stickers() -> Vec<model::Sticker> {
+    std::fs::read_to_string(stickers_path())
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split('\t');
+            let st = model::Sticker { id: f.next()?.into(), pkg: f.next()?.into(), ver: f.next()?.into() };
+            [&st.id, &st.pkg, &st.ver].iter().all(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_digit())).then_some(st)
+        })
+        .collect()
+}
+
+/// 全螢幕看圖。
+struct Viewer {
+    /// 看的是哪一則（msgs 的 id；←→ 從這裡找上一張／下一張）。
+    id: String,
+    path: Option<String>,
+    /// None = 還在下載或解碼。
+    image: Option<StatefulProtocol>,
 }
 
 /// 主題選單。游標移到哪個主題，整個畫面就先換成那個（預覽）；Esc 換回 original。
@@ -210,6 +249,8 @@ struct App {
     player: Option<std::process::Child>,
     /// 搜尋的範圍：全部聊天室。第一次按 `/` 才跟 daemon 要，之後留著用。
     all_chats: Vec<Chat>,
+    /// 好友清單（第一次開搜尋時才要）。
+    contacts: Vec<Chat>,
     /// 按鍵說明開著。
     help: bool,
     /// 說明捲到第幾列。小螢幕（14 吋筆電）放不下整份說明時用。
@@ -253,6 +294,14 @@ struct App {
     cat_prompt: Option<CatPrompt>,
     /// 主題選單（Ctrl-Y）。
     theme_picker: Option<ThemePicker>,
+    /// TUI 內看圖（圖片訊息按 Enter）。
+    viewer: Option<Viewer>,
+    /// 最近用過或看過的貼圖，最近的在前。存在 state 目錄的 stickers 檔。
+    stickers: Vec<model::Sticker>,
+    /// 貼圖選單（Ctrl-G）開著時：選中第幾張。
+    sticker_pick: Option<usize>,
+    /// 貼圖選單的縮圖，依貼圖 id。None = 抓不到或解不開（記住，不要一直重抓）。
+    sticker_imgs: HashMap<String, Option<Protocol>>,
     /// 清單游標停在某個分區標題上（那一區的名稱）。這時 selected 不變，Enter／空白鍵切換收合。
     on_header: Option<String>,
     msg_area: Rect,
@@ -373,6 +422,27 @@ impl App {
         if self.on_header.is_none() && !self.visible(self.selected) {
             self.on_header = Some(section.to_string());
         }
+    }
+
+    /// n／Ctrl-N：照清單順序找下一個有未讀的聊天室並打開，到底繞回最上面。
+    /// 收合的分區也找（未讀數在標題上看得到，不能因為收起來就跳過），找到就展開那一區。
+    fn open_next_unread(&mut self) {
+        let n = self.chats.len();
+        // 聊天室開著：從它的下一個找（它本身已經讀過）。在清單上：游標所在的那個也算。
+        let (start, first) = match self.open.as_ref().and_then(|mid| self.chats.iter().position(|c| &c.mid == mid)) {
+            Some(i) => (i, 1),
+            None => (self.selected, if self.on_header.is_some() { 1 } else { 0 }),
+        };
+        let next = (first..first + n).map(|k| (start + k) % n).find(|&i| self.chats[i].unread > 0 && Some(&self.chats[i].mid) != self.open.as_ref());
+        let Some(i) = next else {
+            self.status = "沒有未讀了".into();
+            return;
+        };
+        let section = self.section_of(i);
+        let _ = self.cats.expand(&section);
+        self.selected = i;
+        self.on_header = None;
+        self.open_selected();
     }
 
     /// 空白鍵（或在標題上按 Enter）：切換游標所在那一區。
@@ -648,6 +718,13 @@ impl App {
             Ok(v) => Update::AllChats(model::parse_chats(&v)),
             Err(e) => Update::Error(e),
         });
+        if self.contacts.is_empty() {
+            self.spawn(|| match client::contacts() {
+                Ok(v) => Update::Contacts(model::parse_chats(&v)),
+                // 拿不到好友清單不影響搜尋聊天室，安靜略過。
+                Err(_) => Update::Contacts(vec![]),
+            });
+        }
     }
 
     /// Ctrl-S：開訊息搜尋。存檔整份讀進來；聊天室名稱要用完整清單才查得到，順便跟 daemon 要。
@@ -668,11 +745,25 @@ impl App {
     }
 
     /// 搜尋結果：名稱包含關鍵字（不分大小寫），維持「最近有動靜的在前」。
+    /// 搜尋結果：先是聊過的聊天室，再來是還沒聊過的好友（開一個新對話）。
     fn search_hits(&self) -> Vec<&Chat> {
         let Some(search) = &self.search else { return vec![] };
         let q = search.query.to_lowercase();
         let pool = if self.all_chats.is_empty() { &self.chats } else { &self.all_chats };
-        pool.iter().filter(|c| c.name.to_lowercase().contains(&q)).collect()
+        let mut hits: Vec<&Chat> = pool.iter().filter(|c| c.name.to_lowercase().contains(&q)).collect();
+        // 好友清單很長（幾百人），沒打字時不列，免得把聊天室擠下去。
+        if !q.is_empty() {
+            hits.extend(self.contacts.iter().filter(|c| {
+                c.name.to_lowercase().contains(&q) && !pool.iter().chain(self.chats.iter()).any(|x| x.mid == c.mid)
+            }));
+        }
+        hits
+    }
+
+    /// 這個聊天室是不是只是好友（還沒聊過）。
+    fn is_new_contact(&self, mid: &str) -> bool {
+        self.contacts.iter().any(|c| c.mid == mid)
+            && !self.chats.iter().chain(self.all_chats.iter()).any(|c| c.mid == mid)
     }
 
     /// 重讀開著的聊天室最新一頁（會標已讀）。
@@ -749,7 +840,10 @@ impl App {
             self.status = "已停止".into();
             return;
         }
-        if m.has_media {
+        if m.kind == "IMAGE" && m.has_media {
+            let id = m.id.clone();
+            self.view_image(id);
+        } else if m.has_media {
             let id = m.id.clone();
             self.status = "下載中…".into();
             self.spawn(move || {
@@ -763,6 +857,101 @@ impl App {
             });
         } else if let Some(url) = m.link.clone() {
             self.status = system_open(&url);
+        }
+    }
+
+    /// 在 TUI 裡全螢幕看一張圖。原檔下載與解碼在背景做（大圖解碼要好一陣子），好了才換上。
+    fn view_image(&mut self, id: String) {
+        self.viewer = Some(Viewer { id: id.clone(), path: None, image: None });
+        self.spawn(move || {
+            let got = client::download(&id)
+                .and_then(|v| v.get("path").and_then(Value::as_str).map(str::to_string).ok_or("daemon 沒回路徑".into()))
+                .and_then(|path| {
+                    let img = image::ImageReader::open(&path)
+                        .map_err(|e| e.to_string())?
+                        .with_guessed_format()
+                        .map_err(|e| e.to_string())?
+                        .decode()
+                        .map_err(|e| format!("圖片解不開：{e}"))?;
+                    Ok((path, img))
+                });
+            match got {
+                Ok((path, img)) => Update::ImageReady(id, path, Box::new(img)),
+                Err(e) => Update::Error(format!("看不了這張圖：{e}")),
+            }
+        });
+    }
+
+    /// 看圖時 ←→：這個聊天室的上一張／下一張圖（只算圖片訊息）。
+    fn viewer_step(&mut self, older: bool) {
+        let Some(v) = &self.viewer else { return };
+        let Some(here) = self.msgs.iter().position(|m| m.id == v.id) else { return };
+        let is_image = |m: &Msg| m.kind == "IMAGE" && m.has_media;
+        let next = if older {
+            self.msgs[..here].iter().rposition(is_image)
+        } else {
+            self.msgs[here + 1..].iter().position(is_image).map(|k| here + 1 + k)
+        };
+        match next {
+            Some(i) => {
+                self.cursor = Some(i); // 關掉看圖時，游標停在最後看的那張
+                let id = self.msgs[i].id.clone();
+                self.view_image(id);
+            }
+            None => self.status = if older { "這是最早的一張".into() } else { "這是最新的一張".into() },
+        }
+    }
+
+    /// 把看到的貼圖收進貼圖選單（排在後面，不打亂「最近用過」的順序）。
+    fn collect_stickers(&mut self) {
+        let seen: Vec<model::Sticker> = self.msgs.iter().filter_map(|m| m.sticker.clone()).collect();
+        let before = self.stickers.len();
+        for st in seen {
+            if !self.stickers.contains(&st) {
+                self.stickers.push(st);
+            }
+        }
+        if self.stickers.len() != before {
+            self.stickers.truncate(STICKERS_MAX);
+            self.save_stickers();
+        }
+    }
+
+    fn save_stickers(&self) {
+        let body: String = self.stickers.iter().map(|s| format!("{}\t{}\t{}\n", s.id, s.pkg, s.ver)).collect();
+        let _ = std::fs::write(stickers_path(), body);
+    }
+
+    /// 送貼圖到開著的聊天室，並把它排到貼圖選單最前面。
+    fn send_sticker(&mut self, st: model::Sticker) {
+        let Some(mid) = self.open.clone() else { return };
+        self.stickers.retain(|s| *s != st);
+        self.stickers.insert(0, st.clone());
+        self.stickers.truncate(STICKERS_MAX);
+        self.save_stickers();
+        self.status = "送出貼圖…".into();
+        self.spawn(move || match client::send_sticker(&mid, &st) {
+            Ok(_) => Update::Sent,
+            Err(e) => Update::Error(format!("貼圖送不出去：{e}")),
+        });
+    }
+
+    /// Ctrl-G：開貼圖選單，順便跟 daemon 要還沒有的縮圖。
+    fn open_sticker_picker(&mut self) {
+        if self.stickers.is_empty() {
+            self.status = "還沒有貼圖：聊天室裡出現過的貼圖會自動收進來（也可以選中一則貼圖按 s）".into();
+            return;
+        }
+        self.sticker_pick = Some(0);
+        for st in &self.stickers {
+            if self.sticker_imgs.contains_key(&st.id) {
+                continue;
+            }
+            let id = st.id.clone();
+            self.spawn(move || match client::sticker_image(&id) {
+                Ok(v) => Update::StickerImage(id, v.get("path").and_then(Value::as_str).unwrap_or("").to_string()),
+                Err(_) => Update::StickerImage(id, String::new()),
+            });
         }
     }
 
@@ -781,12 +970,14 @@ impl App {
     /// f：轉傳選中的訊息。先開聊天室選單，選好才送（見 forward_to）。
     fn start_forward(&mut self) {
         let Some(m) = self.cursor.and_then(|i| self.msgs.get(i)) else { return };
-        let item = if m.has_media {
+        let item = if let Some(st) = m.sticker.clone() {
+            Forward::Sticker(st)
+        } else if m.has_media {
             Forward::File { message_id: m.id.clone() }
         } else if m.kind == "NONE" && !m.text.is_empty() {
             Forward::Text(m.text.clone())
         } else {
-            // 貼圖、FLEX 卡片要用 LINE 自己的格式重送，daemon 沒有這個指令。
+            // FLEX 卡片要用 LINE 自己的格式重送，daemon 沒有這個指令。
             self.status = format!("這種訊息（{}）還不能轉傳", m.kind);
             return;
         };
@@ -801,6 +992,7 @@ impl App {
         self.spawn(move || {
             let sent = match item {
                 Forward::Text(text) => client::send(&mid, &text, serde_json::json!([])).map(|_| ()),
+                Forward::Sticker(st) => client::send_sticker(&mid, &st).map(|_| ()),
                 Forward::File { message_id } => client::download(&message_id).and_then(|v| {
                     let path = v.get("path").and_then(Value::as_str).ok_or("daemon 沒回路徑")?.to_string();
                     client::send_file(&mid, &path).map(|_| ())
@@ -992,6 +1184,21 @@ impl App {
                 self.status.clear();
             }
             Update::Downloaded(path) => self.status = system_open(&path),
+            Update::StickerImage(id, path) => {
+                let proto = image::ImageReader::open(&path)
+                    .ok()
+                    .and_then(|r| r.with_guessed_format().ok())
+                    .and_then(|r| r.decode().ok())
+                    .and_then(|img| self.picker.new_protocol(img, Size::new(STICKER_CELL.0 - 2, STICKER_CELL.1 - 1), Resize::Fit(None)).ok());
+                self.sticker_imgs.insert(id, proto);
+            }
+            Update::ImageReady(id, path, img) => {
+                // 等的這段時間可能已經關掉、或換到別張了。
+                if let Some(v) = self.viewer.as_mut().filter(|v| v.id == id) {
+                    v.path = Some(path);
+                    v.image = Some(self.picker.new_resize_protocol(*img));
+                }
+            }
             Update::Members(chat, list) => {
                 self.members.insert(chat, list);
             }
@@ -1006,6 +1213,7 @@ impl App {
             }
             Update::Session(logged_in) => self.needs_login = !logged_in,
             Update::AllChats(c) => self.all_chats = c,
+            Update::Contacts(c) => self.contacts = c,
             // 回來時游標可能已經移走、或已經開了聊天室 —— 那就是過期的，丟掉。
             Update::Preview(mid, m) => {
                 // 游標已經移走也照樣留著：等一下回來看就不用再抓。
@@ -1019,6 +1227,7 @@ impl App {
             }
             Update::Messages(m) => {
                 self.msgs = m;
+                self.collect_stickers();
                 self.cursor = None; // 索引是舊清單的
                 self.busy = false;
                 self.status.clear();
@@ -1092,6 +1301,10 @@ impl App {
                 self.reload_open();
             }
             Update::Status(text) => self.status = text,
+            Update::Error(e) if self.viewer.as_ref().is_some_and(|v| v.image.is_none()) && !e.is_empty() => {
+                self.viewer = None; // 載入失敗：關掉空白的看圖畫面，錯誤顯示在狀態列
+                self.status = e;
+            }
             Update::Error(e) => {
                 self.busy = false;
                 self.status = e;
@@ -2001,7 +2214,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     } else if peeking.is_some() {
         ("預覽", keys(&[("↑↓", "選擇"), ("Enter", "進入"), ("Esc", "回到這個聊天室")]))
     } else if app.cursor.is_some() {
-        ("選取", keys(&[("r", "表情"), ("f", "轉傳"), ("d", "收回"), ("Enter", "開啟"), ("Tab", "上一個"), ("Esc", "取消")]))
+        ("選取", keys(&[("r", "表情"), ("f", "轉傳"), ("s", "跟著貼"), ("d", "收回"), ("Enter", "開啟"), ("Esc", "取消")]))
     } else if in_chat {
         if tight {
             // 放不下全部：先給離開這個畫面的鍵，其餘看 F1。
@@ -2012,7 +2225,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     } else if tight {
         ("清單", keys(&[("Enter", "開啟"), ("/", "搜尋"), ("?", "按鍵")]))
     } else {
-        ("清單", keys(&[("↑↓", "選擇"), ("Enter", "開啟"), ("/", "搜尋"), ("?", "按鍵"), ("q", "離開")]))
+        ("清單", keys(&[("↑↓", "選擇"), ("Enter", "開啟"), ("n", "下一個未讀"), ("/", "搜尋"), ("?", "按鍵"), ("q", "離開")]))
     };
     let mut left = vec![
         Span::styled(
@@ -2088,7 +2301,7 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 }
 
 /// 搜尋與按鍵說明的浮層。draw() 最後呼叫，蓋在其他東西上面。
-fn draw_overlays(f: &mut Frame, app: &App) {
+fn draw_overlays(f: &mut Frame, app: &mut App) {
     let accent = app.theme.accent;
     let bold = Style::new().add_modifier(Modifier::BOLD);
 
@@ -2127,12 +2340,15 @@ fn draw_overlays(f: &mut Frame, app: &App) {
             .map(|(i, c)| {
                 let picked = i == search.pick;
                 let badge = if c.unread > 0 { format!(" {} ", c.unread.min(999)) } else { String::new() };
-                let name = fit(&c.name, w.saturating_sub(3 + badge.width()));
-                let pad = w.saturating_sub(2 + name.width() + badge.width());
+                // 還沒聊過的好友：標出來，選了是開新對話。
+                let note = if app.is_new_contact(&c.mid) { "好友・新對話" } else { "" };
+                let name = fit(&c.name, w.saturating_sub(3 + badge.width() + note.width()));
+                let pad = w.saturating_sub(2 + name.width() + badge.width() + note.width());
                 let line = Line::from(vec![
                     Span::styled(if picked { "▌ " } else { "  " }, Style::new().fg(accent)),
                     Span::styled(name, if picked { bold.fg(accent) } else { Style::new() }),
                     Span::raw(" ".repeat(pad)),
+                    Span::styled(note, dim()),
                     Span::styled(badge, Style::new().fg(app.theme.on_accent).bg(accent)),
                 ]);
                 match app.theme.selection {
@@ -2238,6 +2454,65 @@ fn draw_overlays(f: &mut Frame, app: &App) {
                 f.render_widget(Paragraph::new(note).style(dim()), list);
             } else {
                 f.render_widget(Paragraph::new(lines), list);
+            }
+        }
+    }
+
+    if let Some(v) = app.viewer.as_mut() {
+        let area = f.area();
+        f.render_widget(Clear, area);
+        let mut block = pane(Line::from(Span::styled(" 圖片 ", bold)), true, accent).title_bottom(
+            Line::from(" ←→ 上一張／下一張   o 用外部程式開   Esc 關閉 ").right_aligned(),
+        );
+        // 狀態列被全螢幕蓋住了，「這是最早的一張」之類的訊息改放在這裡。
+        if !app.status.is_empty() {
+            block = block.title_bottom(Line::from(Span::styled(format!(" {} ", app.status), Style::new().fg(app.theme.warning))));
+        }
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        match v.image.as_mut() {
+            Some(img) => {
+                // 等比例縮到放得下，置中。
+                let size = img.size_for(Resize::Fit(None), inner.as_size());
+                let spot = Rect {
+                    x: inner.x + inner.width.saturating_sub(size.width) / 2,
+                    y: inner.y + inner.height.saturating_sub(size.height) / 2,
+                    width: size.width.min(inner.width),
+                    height: size.height.min(inner.height),
+                };
+                f.render_stateful_widget(StatefulImage::default(), spot, img);
+            }
+            None => {
+                let mid = Rect { y: inner.y + inner.height / 2, height: 1.min(inner.height), ..inner };
+                f.render_widget(Paragraph::new("載入中…").style(dim()).alignment(Alignment::Center), mid);
+            }
+        }
+        return; // 全螢幕，其他浮層不用畫
+    }
+
+    if let Some(pick) = app.sticker_pick {
+        let (cw, ch) = STICKER_CELL;
+        let area = centered(f.area(), cw * 6 + 2, ch * 4 + 2);
+        f.render_widget(Clear, area);
+        let block = pane(Line::from(Span::styled(" 貼圖 ", bold)), true, accent)
+            .title_bottom(Line::from(" 方向鍵選   Enter 送出   Esc 取消 ").right_aligned());
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let per_row = (inner.width / cw).max(1) as usize;
+        let rows = (inner.height / ch).max(1) as usize;
+        // 選中的那張永遠看得到：一次一頁，捲到選中那一列。
+        let first_row = (pick / per_row + 1).saturating_sub(rows);
+        for (i, st) in app.stickers.iter().enumerate().skip(first_row * per_row).take(per_row * rows) {
+            let (col, row) = ((i % per_row) as u16, (i / per_row - first_row) as u16);
+            let cell = Rect { x: inner.x + col * cw, y: inner.y + row * ch, width: cw, height: ch };
+            if i == pick {
+                f.render_widget(Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(accent)), cell);
+            }
+            let img_area = Rect { x: cell.x + 1, y: cell.y, width: cw - 2, height: ch - 1 };
+            match app.sticker_imgs.get(&st.id) {
+                Some(Some(p)) => f.render_widget(ratatui_image::Image::new(p), img_area),
+                Some(None) => f.render_widget(Paragraph::new("[貼圖]").style(dim()), img_area),
+                None => f.render_widget(Paragraph::new("…").style(dim()), img_area),
             }
         }
     }
@@ -2357,6 +2632,7 @@ fn draw_overlays(f: &mut Frame, app: &App) {
                 ("Ctrl-S", "搜尋訊息內容（本機存檔，比兩週更早的也找得到）"),
                 ("r", "重整清單"),
                 ("c", "幫選中的聊天室選分類（聊天室裡用 Ctrl-T）"),
+                ("n", "打開下一個有未讀的聊天室（任何時候都可以按 Ctrl-N）"),
                 ("空白鍵", "收合／展開游標所在的分區"),
                 ("q", "離開"),
             ]),
@@ -2365,7 +2641,7 @@ fn draw_overlays(f: &mut Frame, app: &App) {
                 ("← →  ^← ^→", "輸入框：移一個字／跳一個詞"),
                 ("Home End", "輸入框：開頭／結尾（也可 Ctrl-A、Ctrl-E）"),
                 ("^W ^U ^K", "刪前一個詞／刪到開頭／刪到結尾"),
-                ("Tab  ⇧Tab", "選訊息（之後 r 表情、f 轉傳、d 收回、Enter 開）"),
+                ("Tab  ⇧Tab", "選訊息（之後 r 表情、f 轉傳、s 跟著貼貼圖、d 收回、Enter 開）"),
                 ("PgUp PgDn", "捲動訊息"),
                 ("g", "載入更舊的訊息（輸入框空的時候）"),
                 ("/", "搜尋全部聊天室（輸入框空的時候）"),
@@ -2381,6 +2657,7 @@ fn draw_overlays(f: &mut Frame, app: &App) {
             ("附件", &[
                 ("Ctrl-V", "貼上：圖片或複製的檔案變附件"),
                 ("Ctrl-F", "附加檔案（輸入路徑，Tab 補完）"),
+                ("Ctrl-G", "貼圖（最近用過與聊天室裡出現過的）"),
                 ("拖檔案進來", "附加那個檔案"),
             ]),
             ("任何時候", &[
@@ -2747,6 +3024,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         members: HashMap::new(),
         pending_mentions: Vec::new(),
         all_chats: vec![],
+        contacts: vec![],
         help: false,
         help_scroll: 0,
         help_max: std::cell::Cell::new(0),
@@ -2761,6 +3039,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cats: categories::Categories::load(&client::state_dir()),
         cat_prompt: None,
         theme_picker: None,
+        viewer: None,
+        stickers: load_stickers(),
+        sticker_pick: None,
+        sticker_imgs: HashMap::new(),
         on_header: None,
         msg_rects: vec![],
         cursor: None,
@@ -2879,7 +3161,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         // 浮層開著時滑鼠不作用，免得點穿到底下的清單。
-        if matches!(ev, Event::Mouse(_)) && (app.help || app.search.is_some() || app.msg_search.is_some() || app.path_prompt.is_some() || app.react_picker || app.mention.is_some() || app.cat_prompt.is_some() || app.theme_picker.is_some()) {
+        // 看圖時：點一下就關掉，其他滑鼠動作不理。
+        if let (Event::Mouse(m), Some(_)) = (&ev, &app.viewer) {
+            if matches!(m.kind, MouseEventKind::Down(_)) {
+                app.viewer = None;
+            }
+            continue;
+        }
+        if matches!(ev, Event::Mouse(_)) && (app.help || app.search.is_some() || app.msg_search.is_some() || app.path_prompt.is_some() || app.react_picker || app.mention.is_some() || app.cat_prompt.is_some() || app.theme_picker.is_some() || app.sticker_pick.is_some()) {
             continue;
         }
         if let Event::Mouse(m) = ev {
@@ -2951,6 +3240,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             break Ok(());
+        }
+        // 貼圖選單開著時，按鍵全部歸它。
+        if let Some(pick) = app.sticker_pick {
+            let n = app.stickers.len();
+            let per_row = 6; // 跟畫面一樣：centered 的寬度是 6 格
+            let next = match key.code {
+                KeyCode::Left => pick.saturating_sub(1),
+                KeyCode::Right => (pick + 1).min(n.saturating_sub(1)),
+                KeyCode::Up => pick.saturating_sub(per_row),
+                KeyCode::Down => (pick + per_row).min(n.saturating_sub(1)),
+                KeyCode::Enter => {
+                    app.sticker_pick = None;
+                    if let Some(st) = app.stickers.get(pick).cloned() {
+                        app.send_sticker(st);
+                    }
+                    continue;
+                }
+                KeyCode::Esc => {
+                    app.sticker_pick = None;
+                    continue;
+                }
+                _ => pick,
+            };
+            app.sticker_pick = Some(next);
+            continue;
+        }
+        // 看圖時，按鍵全部歸它。
+        if let Some(v) = app.viewer.as_ref() {
+            match key.code {
+                KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('k') => app.viewer_step(true),
+                KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('j') => app.viewer_step(false),
+                KeyCode::Char('o') => {
+                    if let Some(path) = v.path.clone() {
+                        app.status = system_open(&path);
+                    }
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break Ok(()),
+                // Esc／q／Enter 都是關掉。
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => app.viewer = None,
+                _ => {}
+            }
+            continue;
         }
         // 主題選單開著時，按鍵全部歸它。
         if let Some(tp) = app.theme_picker.as_mut() {
@@ -3188,6 +3519,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             continue;
         }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('n') {
+            app.open_next_unread();
+            continue;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
             app.toggle_vip();
             continue;
@@ -3216,6 +3551,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let mut prompt = PathPrompt::default();
                     prompt.set("~/".into());
                     app.path_prompt = Some(prompt);
+                    continue;
+                }
+                KeyCode::Char('g') => {
+                    app.open_sticker_picker();
                     continue;
                 }
                 KeyCode::Char('t') => {
@@ -3304,6 +3643,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             KeyCode::Char('r') if app.cursor.is_some() && app.input.is_empty() => app.react_picker = true,
             KeyCode::Char('d') if app.cursor.is_some() && app.input.is_empty() => app.unsend_selected(),
             KeyCode::Char('f') if app.cursor.is_some() && app.input.is_empty() => app.start_forward(),
+            // 選中一則貼圖按 s：送一張一樣的到這個聊天室（跟著貼）。
+            KeyCode::Char('s') if app.cursor.is_some() && app.input.is_empty() => {
+                match app.cursor.and_then(|i| app.msgs.get(i)).and_then(|m| m.sticker.clone()) {
+                    Some(st) => {
+                        app.cursor = None;
+                        app.send_sticker(st);
+                    }
+                    None => app.status = "選中的不是貼圖".into(),
+                }
+            }
             // 群組裡打 @：挑人。一對一沒有要提及的對象。
             KeyCode::Char('@')
                 if app.open.as_deref().is_some_and(|c| !c.starts_with('u')) =>
@@ -3322,6 +3671,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // 空白鍵：收合／展開游標所在的分區。
                         ' ' => app.toggle_current_section(),
                         'c' => app.start_cat_prompt(),
+                        'n' => app.open_next_unread(),
                         'r' => app.load_chats(),
                         '/' => app.start_search(),
                         '?' => {

@@ -199,6 +199,19 @@ const handlers: Record<string, (line: Line, req: any) => Promise<unknown>> = {
     await line.react(String(req.messageId), String(req.type));
     return { reacted: true };
   },
+  async sendSticker(line, req) {
+    if (!req.chat || !req.sticker) throw new Error("缺 chat 或 sticker");
+    const { id, pkg, ver } = req.sticker;
+    await line.sendSticker(String(req.chat), { id: String(id), pkg: String(pkg), ver: String(ver) });
+    return { sent: true };
+  },
+  async stickerImage(line, req) {
+    if (!req.id) throw new Error("缺 id");
+    return { path: await line.stickerImage(String(req.id)) };
+  },
+  async contacts(line) {
+    return await line.contacts();
+  },
   async members(line, req) {
     if (!req.chat) throw new Error("缺 chat");
     return await line.members(String(req.chat));

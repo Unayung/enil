@@ -102,6 +102,21 @@ pub fn react(message_id: &str, kind: &str) -> Result<Value, String> {
     request(json!({ "cmd": "react", "messageId": message_id, "type": kind }))
 }
 
+/// 送貼圖。
+pub fn send_sticker(chat: &str, s: &crate::model::Sticker) -> Result<Value, String> {
+    request(json!({ "cmd": "sendSticker", "chat": chat, "sticker": { "id": s.id, "pkg": s.pkg, "ver": s.ver } }))
+}
+
+/// 某張貼圖的圖檔（daemon 從 CDN 抓好快取），回傳 { path }。
+pub fn sticker_image(id: &str) -> Result<Value, String> {
+    request(json!({ "cmd": "stickerImage", "id": id }))
+}
+
+/// 好友清單 [{mid, name}]（含還沒聊過的）。
+pub fn contacts() -> Result<Value, String> {
+    request(json!({ "cmd": "contacts" }))
+}
+
 pub fn members(chat: &str) -> Result<Value, String> {
     request(json!({ "cmd": "members", "chat": chat }))
 }

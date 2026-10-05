@@ -41,6 +41,15 @@ pub struct Msg {
     pub reactions: Vec<String>,
     /// @ 了誰（mid；"all" 是 @所有人）。
     pub mentions: Vec<String>,
+    /// 貼圖訊息的參數（id, 貼圖組, 版本）。送一張一樣的貼圖要這三個。
+    pub sticker: Option<Sticker>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Sticker {
+    pub id: String,
+    pub pkg: String,
+    pub ver: String,
 }
 
 /// 表情回應的種類 → 畫面上的符號。
@@ -148,6 +157,7 @@ pub fn parse_msgs(v: &Value, me: &str) -> Vec<Msg> {
                             .and_then(Value::as_array)
                             .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
                             .unwrap_or_default(),
+                        sticker: m.get("sticker").map(|v| Sticker { id: s(v, "id"), pkg: s(v, "pkg"), ver: s(v, "ver") }).filter(|k| !k.id.is_empty()),
                     }
                 })
                 .collect()

@@ -45,6 +45,8 @@ export interface Msg {
   altText?: string;
   /** FLEX 版面裡的圖片網址（carousel 的每個 bubble 一張），公開 CDN，不需認證 */
   flexImages?: string[];
+  /** 貼圖的參數（貼圖訊息才有）。送一張一樣的貼圖要這三個。 */
+  sticker?: { id: string; pkg: string; ver: string };
   /** FLEX 版面裡的文字，一個元件一行。altText 常常只是「您有新訊息」，內容在這裡 */
   flexText?: string;
   /** FLEX 版面裡的連結（uri action） */
@@ -148,6 +150,21 @@ export function flexOf(json: string): { images: string[]; text: string; links: s
 
 /** chats() 幫前幾個聊天室準備大頭貼。 */
 const AVATAR_CHATS = 60;
+
+function stickerUrl(id: string): string {
+  return `https://stickershop.line-scdn.net/stickershop/v1/sticker/${id}/android/sticker.png`;
+}
+
+/** 訊息 metadata 裡的貼圖參數。三個都要是數字才算，缺一個就送不出一樣的貼圖。 */
+export function stickerOf(meta: any): { id: string; pkg: string; ver: string } | undefined {
+  const [id, pkg, ver] = [meta?.STKID, meta?.STKPKGID, meta?.STKVER].map((v) => String(v ?? ""));
+  return [id, pkg, ver].every((v) => /^\d+$/.test(v)) ? { id, pkg, ver } : undefined;
+}
+
+/** 好友清單快取多久。 */
+const CONTACTS_TTL_MS = 10 * 60_000;
+/** getContacts 一次查幾個人。 */
+const CONTACTS_BATCH = 100;
 
 const MAC_CHUNK = 131072;
 
@@ -355,8 +372,8 @@ export class Line {
         } else if (m.contentType === "STICKER") {
           const stk = String(this.#raw.get(m.id)?.contentMetadata?.STKID ?? "");
           if (/^\d+$/.test(stk)) {
-            m.thumbPath = await this.#cachePublic(
-              `${m.id}.thumb`, `https://stickershop.line-scdn.net/stickershop/v1/sticker/${stk}/android/sticker.png`);
+            // 檔名用貼圖 id：同一張貼圖在很多訊息裡出現，抓一次就好（貼圖選單也用這份）。
+            m.thumbPath = await this.#cachePublic(`sticker-${stk}.thumb`, stickerUrl(stk));
           }
         } else {
           m.thumbPath = await this.#cachePublic(`${m.id}.thumb`, m.flexImages![0]);
@@ -409,6 +426,25 @@ export class Line {
     }
   }
 
+  /**
+   * 送貼圖。Letter Sealing（E2EE）不加密貼圖，一般聊天室與 E2EE 聊天室都是明文送 ——
+   * 貼圖訊息本來就沒有文字可以加密，內容就是這三個參數。
+   */
+  async sendSticker(chatMid: string, s: { id: string; pkg: string; ver: string }): Promise<void> {
+    if (![s.id, s.pkg, s.ver].every((v) => /^\d+$/.test(v))) throw new Error("貼圖參數要是數字");
+    await this.#base.talk.sendMessage({
+      to: chatMid,
+      contentType: "STICKER" as any,
+      contentMetadata: { STKID: s.id, STKPKGID: s.pkg, STKVER: s.ver },
+    });
+  }
+
+  /** 某張貼圖的圖檔（本機路徑），給貼圖選單畫縮圖。跟訊息裡的貼圖走同一個 CDN、同一份快取。 */
+  async stickerImage(id: string): Promise<string> {
+    if (!/^\d+$/.test(id)) throw new Error("貼圖 id 要是數字");
+    return await this.#cachePublic(`sticker-${id}.thumb`, stickerUrl(id));
+  }
+
   /** 收回自己的訊息。 */
   async unsend(messageId: string): Promise<void> {
     await this.#base.talk.unsendMessage({ seq: await this.#base.getReqseq("talk"), messageId });
@@ -418,6 +454,26 @@ export class Line {
   async react(messageId: string, type: string): Promise<void> {
     if (!REACTIONS.includes(type as any) || type === "ALL") throw new Error(`不認得的表情：${type}`);
     await this.#base.talk.react({ id: BigInt(messageId), reaction: type as any });
+  }
+
+  #contacts?: { at: number; list: { mid: string; name: string }[] };
+
+  /**
+   * 好友清單：mid 與顯示名稱。給「跟還沒聊過的好友開對話」用 —— chats() 只列有訊息的聊天室。
+   * 好友不常變，快取 10 分鐘；每次打開搜尋都拉幾百人沒有必要。
+   */
+  async contacts(): Promise<{ mid: string; name: string }[]> {
+    if (this.#contacts && Date.now() - this.#contacts.at < CONTACTS_TTL_MS) return this.#contacts.list;
+    const ids: unknown = await this.#base.talk.getAllContactIds({ syncReason: "INTERNAL" } as any);
+    const mids = (Array.isArray(ids) ? ids : []).map(String).filter((m) => m.startsWith("u") && m !== this.me.mid);
+    // getContacts 一次要太多會被拒；分批。
+    for (let i = 0; i < mids.length; i += CONTACTS_BATCH) {
+      const batch = mids.slice(i, i + CONTACTS_BATCH);
+      await this.#resolveNames(batch, batch.map(() => "USER"));
+    }
+    const list = mids.map((mid) => ({ mid, name: this.#names.get(mid) ?? mid.slice(0, 8) }));
+    this.#contacts = { at: Date.now(), list };
+    return list;
   }
 
   /** 群組成員（打 @ 時挑人用）：mid 與顯示名稱，不含自己。 */
@@ -913,6 +969,7 @@ export class Line {
         : undefined,
       // 解密之後才讀：E2EE 訊息的 MENTION 可能在加密的內容裡，decrypt 會把它併回 contentMetadata。
       mentions: mentionsOf(raw.contentMetadata?.MENTION),
+      sticker: stickerOf(raw.contentMetadata),
     };
   }
 

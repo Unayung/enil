@@ -12,7 +12,7 @@ import assert from "node:assert";
 import { createHash, createHmac } from "node:crypto";
 // 動態 import：靜態 import 會被提到最前面，比上面那行設環境變數還早執行，
 // 那樣 paths.js 算出來的就是真的狀態目錄。
-const { chunkedMac, flexOf, safeExt, mentionsOf, mentionMeta, reactionName } = await import("./line.js");
+const { chunkedMac, flexOf, safeExt, mentionsOf, mentionMeta, reactionName, stickerOf } = await import("./line.js");
 
 const flex = flexOf(JSON.stringify({
   type: "bubble",
@@ -125,5 +125,11 @@ assert.equal(reactionName(undefined), "OTHER"); // 自訂／付費回應
   const net = refreshFailureReason(new Error("connect ETIMEDOUT 147.92.185.2:443"));
   assert.ok(net.includes("網路") && net.includes("不必重新登入") && net.includes("ETIMEDOUT"));
 }
+
+// 貼圖參數：三個都要是數字，缺一個或夾了別的東西都不算（不能拿去拼網址）。
+assert.deepEqual(stickerOf({ STKID: "52002734", STKPKGID: "11537", STKVER: "1" }), { id: "52002734", pkg: "11537", ver: "1" });
+assert.equal(stickerOf({ STKID: "52002734", STKPKGID: "11537" }), undefined);
+assert.equal(stickerOf({ STKID: "1/../x", STKPKGID: "1", STKVER: "1" }), undefined);
+assert.equal(stickerOf(undefined), undefined);
 
 console.log("ok");
