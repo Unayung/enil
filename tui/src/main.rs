@@ -120,6 +120,8 @@ struct App {
     msgs: Vec<Msg>,
     scroll: u16,
     input: String,
+    /// 輸入框的游標，以字（char）為單位，0..=input 的字數。
+    caret: usize,
     status: String,
     me: String,
     open: Option<String>,
@@ -406,6 +408,7 @@ impl App {
     /// 把輸入框收進目前聊天室的草稿，清空輸入框。離開聊天室（切到別的、回清單）時呼叫。
     fn stash_draft(&mut self) {
         let text = std::mem::take(&mut self.input);
+        self.caret = 0;
         if let Some(mid) = &self.open {
             if text.trim().is_empty() {
                 self.drafts.remove(mid);
@@ -424,6 +427,7 @@ impl App {
             self.selected = i;
         }
         self.input = self.drafts.remove(&mid).unwrap_or_default();
+        self.caret = self.input.chars().count(); // 草稿回來時游標在最後
         let me = self.me.clone();
         self.open = Some(mid.clone());
         self.msgs.clear();
@@ -674,6 +678,7 @@ impl App {
             return;
         }
         self.input.clear();
+        self.caret = 0;
         let mentions = mention_spans(&text, &std::mem::take(&mut self.pending_mentions));
         self.status = "傳送中…".into();
         // 附件與文字分開送，附件先：LINE 沒有「圖片加說明」這種單一訊息。
@@ -722,7 +727,7 @@ impl App {
         if one_line && Path::new(&local_path(text)).is_file() {
             self.attach_file(text);
         } else {
-            self.input.push_str(text.trim_end_matches('\n'));
+            insert_at(&mut self.input, &mut self.caret, text.trim_end_matches('\n'));
         }
     }
 
@@ -1691,19 +1696,8 @@ fn draw(f: &mut Frame, app: &mut App) {
     });
     let chip_w = chip.as_ref().map_or(0, |c| c.width() + 1);
     let room = (input_inner.width.saturating_sub(3) as usize).saturating_sub(chip_w); // 「› 」與游標那一格
-    // 打超過寬度時顯示尾巴：正在打的那幾個字要看得到。
-    let mut shown = String::new();
-    let mut used = 0;
-    for c in app.input.chars().rev() {
-        // 貼進來的多行文字：輸入框只有一行，換行用符號表示，送出時還是真的換行。
-        let c = if c == '\n' { '⏎' } else { c };
-        let w = c.width().unwrap_or(0);
-        if used + w > room {
-            break;
-        }
-        shown.insert(0, c);
-        used += w;
-    }
+    // 放不下時捲動，游標永遠看得到。used = 游標前面那段的顯示寬度（畫游標位置用）。
+    let (shown, used) = input_window(&app.input, app.caret, room);
     let body = match (in_chat, app.input.is_empty()) {
         _ if peeking.is_some() => Span::styled(
             format!(
@@ -2032,6 +2026,9 @@ fn draw_overlays(f: &mut Frame, app: &App) {
             ]),
             ("對話", &[
                 ("Enter", "送出（輸入框有字時）"),
+                ("← →  ^← ^→", "輸入框：移一個字／跳一個詞"),
+                ("Home End", "輸入框：開頭／結尾（也可 Ctrl-A、Ctrl-E）"),
+                ("^W ^U ^K", "刪前一個詞／刪到開頭／刪到結尾"),
                 ("Tab  ⇧Tab", "選訊息（之後 r 表情、d 收回、Enter 開）"),
                 ("PgUp PgDn", "捲動訊息"),
                 ("g", "載入更舊的訊息（輸入框空的時候）"),
@@ -2237,6 +2234,106 @@ fn login_screen(
     }
 }
 
+/// 輸入框的編輯動作。
+#[derive(Clone, Copy)]
+enum Edit {
+    Left,
+    Right,
+    WordLeft,
+    WordRight,
+    Home,
+    End,
+    Backspace,
+    Delete,
+    /// Ctrl-W：刪掉游標前一個詞（先跳過空白，再刪到下一個空白）。
+    DeleteWord,
+    /// Ctrl-U：刪到開頭。
+    DeleteToStart,
+    /// Ctrl-K：刪到結尾。
+    DeleteToEnd,
+}
+
+/// 字的索引 → 位元組索引。String 只能用位元組切，游標用字算（中文一個字三個位元組）。
+fn byte_at(text: &str, caret: usize) -> usize {
+    text.char_indices().nth(caret).map_or(text.len(), |(i, _)| i)
+}
+
+/// 游標往左跳一個詞之後的位置。詞以空白分隔：連續的中文會被當成一個詞。
+fn word_left(chars: &[char], mut i: usize) -> usize {
+    while i > 0 && chars[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    while i > 0 && !chars[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    i
+}
+
+fn word_right(chars: &[char], mut i: usize) -> usize {
+    while i < chars.len() && chars[i].is_whitespace() {
+        i += 1;
+    }
+    while i < chars.len() && !chars[i].is_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+fn edit(text: &mut String, caret: &mut usize, op: Edit) {
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let at = (*caret).min(len);
+    // 刪掉 [from, to) 這幾個字，游標停在 from。
+    let mut cut = |from: usize, to: usize| {
+        let (b0, b1) = (byte_at(text, from), byte_at(text, to));
+        text.replace_range(b0..b1, "");
+        *caret = from;
+    };
+    match op {
+        Edit::Left => *caret = at.saturating_sub(1),
+        Edit::Right => *caret = (at + 1).min(len),
+        Edit::WordLeft => *caret = word_left(&chars, at),
+        Edit::WordRight => *caret = word_right(&chars, at),
+        Edit::Home => *caret = 0,
+        Edit::End => *caret = len,
+        Edit::Backspace if at > 0 => cut(at - 1, at),
+        Edit::Delete if at < len => cut(at, at + 1),
+        Edit::DeleteWord => cut(word_left(&chars, at), at),
+        Edit::DeleteToStart => cut(0, at),
+        Edit::DeleteToEnd => cut(at, len),
+        Edit::Backspace | Edit::Delete => {}
+    }
+}
+
+/// 在游標處插入，游標移到插入的字後面。
+fn insert_at(text: &mut String, caret: &mut usize, s: &str) {
+    let at = (*caret).min(text.chars().count());
+    text.insert_str(byte_at(text, at), s);
+    *caret = at + s.chars().count();
+}
+
+/// 輸入框只有一行：決定要顯示哪一段，回傳（顯示的字, 游標在顯示段裡的顯示寬度）。
+/// 游標一定看得見；游標後面若還有字，留三分之一的寬度給它們，不要讓游標老是貼在右邊。
+fn input_window(text: &str, caret: usize, room: usize) -> (String, usize) {
+    // 貼進來的多行文字：換行用符號表示，送出時還是真的換行。
+    let chars: Vec<char> = text.chars().map(|c| if c == '\n' { '⏎' } else { c }).collect();
+    let caret = caret.min(chars.len());
+    let w = |c: &char| c.width().unwrap_or(0);
+    let after_w: usize = chars[caret..].iter().map(w).sum();
+    let budget = room.saturating_sub(after_w.min(room / 3));
+    let (mut start, mut used) = (caret, 0);
+    while start > 0 && used + w(&chars[start - 1]) <= budget {
+        start -= 1;
+        used += w(&chars[start]);
+    }
+    let (mut end, mut total) = (caret, used);
+    while end < chars.len() && total + w(&chars[end]) <= room {
+        total += w(&chars[end]);
+        end += 1;
+    }
+    (chars[start..end].iter().collect(), used)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 先確認 daemon 活著並拿到自己的 mid —— 沒有它就分不出哪些訊息是自己發的。
     let state = client::request(serde_json::json!({ "cmd": "state" }))?;
@@ -2284,6 +2381,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         msgs: vec![],
         scroll: 0,
         input: String::new(),
+        caret: 0,
         status: "載入聊天室…".into(),
         me,
         open: None,
@@ -2572,7 +2670,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 KeyCode::Down if m.pick + 1 < hits.len() => m.pick += 1,
                 KeyCode::Backspace if m.query.is_empty() => {
                     app.mention = None;
-                    app.input.pop(); // 連那個 @ 一起刪
+                    edit(&mut app.input, &mut app.caret, Edit::Backspace); // 連那個 @ 一起刪
                 }
                 KeyCode::Backspace => {
                     m.query.pop();
@@ -2584,7 +2682,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 KeyCode::Enter => {
                     if let Some((mid, name)) = hits.get(m.pick).cloned() {
-                        app.input.push_str(&format!("{name} ")); // 輸入框裡已經有那個 @
+                        insert_at(&mut app.input, &mut app.caret, &format!("{name} ")); // 輸入框裡已經有那個 @
                         app.pending_mentions.push((mid, name));
                     }
                     app.mention = None;
@@ -2718,6 +2816,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     app.path_prompt = Some(prompt);
                     continue;
                 }
+                // 終端機慣用的編輯鍵。沒攔下來的話，Ctrl-A 會把「a」打進輸入框。
+                KeyCode::Char(c @ ('a' | 'e' | 'w' | 'u' | 'k')) => {
+                    let op = match c {
+                        'a' => Edit::Home,
+                        'e' => Edit::End,
+                        'w' => Edit::DeleteWord,
+                        'u' => Edit::DeleteToStart,
+                        _ => Edit::DeleteToEnd,
+                    };
+                    edit(&mut app.input, &mut app.caret, op);
+                    continue;
+                }
                 _ => {}
             }
         }
@@ -2737,8 +2847,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             KeyCode::Backspace if app.open.is_none() => {}
             // 輸入框已經空了再按一次，才拿掉附件。
             KeyCode::Backspace if app.input.is_empty() => app.attach = None,
-            KeyCode::Backspace => {
-                app.input.pop();
+            KeyCode::Backspace => edit(&mut app.input, &mut app.caret, Edit::Backspace),
+            // 輸入框的游標。沒開聊天室時沒有輸入框，這些鍵不做事。
+            KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End | KeyCode::Delete
+                if app.open.is_some() =>
+            {
+                let word = key.modifiers.contains(KeyModifiers::CONTROL);
+                let op = match key.code {
+                    KeyCode::Left if word => Edit::WordLeft,
+                    KeyCode::Right if word => Edit::WordRight,
+                    KeyCode::Left => Edit::Left,
+                    KeyCode::Right => Edit::Right,
+                    KeyCode::Home => Edit::Home,
+                    KeyCode::End => Edit::End,
+                    _ => Edit::Delete,
+                };
+                edit(&mut app.input, &mut app.caret, op);
             }
             KeyCode::Up => {
                 app.selected = app.selected.saturating_sub(1);
@@ -2776,7 +2900,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             KeyCode::Char('@')
                 if app.open.as_deref().is_some_and(|c| !c.starts_with('u')) =>
             {
-                app.input.push('@');
+                insert_at(&mut app.input, &mut app.caret, "@");
                 app.start_mention();
             }
             KeyCode::Char(c) => {
@@ -2805,7 +2929,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else if app.input.is_empty() && c == '/' {
                     app.start_search();
                 } else {
-                    app.input.push(c);
+                    insert_at(&mut app.input, &mut app.caret, c.encode_utf8(&mut [0; 4]));
                 }
             }
             _ => {}
@@ -2889,6 +3013,49 @@ mod tests {
         assert_eq!(spans, serde_json::json!([{"mid":"u1","start":3,"end":6},{"mid":"u2","start":9,"end":13}]));
         // 挑了又刪掉的不算。
         assert_eq!(mention_spans("沒有提及", &picked), serde_json::json!([]));
+    }
+
+    #[test]
+    fn input_editing() {
+        let run = |text: &str, caret: usize, ops: &[Edit]| {
+            let (mut t, mut c) = (text.to_string(), caret);
+            for op in ops {
+                edit(&mut t, &mut c, *op);
+            }
+            (t, c)
+        };
+        // 中文一個字三個位元組，游標以字算。
+        assert_eq!(run("你好世界", 4, &[Edit::Left, Edit::Left, Edit::Backspace]), ("你世界".into(), 1));
+        assert_eq!(run("你好世界", 0, &[Edit::Delete, Edit::End]), ("好世界".into(), 3));
+        // 頭尾按過頭不會壞。
+        assert_eq!(run("ab", 0, &[Edit::Left, Edit::Backspace]), ("ab".into(), 0));
+        assert_eq!(run("ab", 2, &[Edit::Right, Edit::Delete]), ("ab".into(), 2));
+        // 詞：以空白分隔。
+        assert_eq!(run("hello big world", 15, &[Edit::WordLeft]), ("hello big world".into(), 10));
+        assert_eq!(run("hello big world", 15, &[Edit::DeleteWord]), ("hello big ".into(), 10));
+        assert_eq!(run("hello big ", 10, &[Edit::DeleteWord]), ("hello ".into(), 6));
+        assert_eq!(run("hello big world", 0, &[Edit::WordRight, Edit::WordRight]), ("hello big world".into(), 9));
+        assert_eq!(run("hello world", 5, &[Edit::DeleteToStart]), (" world".into(), 0));
+        assert_eq!(run("hello world", 5, &[Edit::DeleteToEnd]), ("hello".into(), 5));
+        // 插入在游標處。
+        let (mut t, mut c) = ("你世界".to_string(), 1);
+        insert_at(&mut t, &mut c, "好");
+        assert_eq!((t.as_str(), c), ("你好世界", 2));
+    }
+
+    #[test]
+    fn input_window_keeps_caret_visible() {
+        // 放得下：全部顯示，游標寬度照實算（中文兩格）。
+        assert_eq!(input_window("你好", 1, 20), ("你好".into(), 2));
+        // 放不下、游標在最後：顯示尾巴（跟以前一樣）。
+        let (s, w) = input_window("abcdefghij", 10, 4);
+        assert_eq!((s.as_str(), w), ("ghij", 4));
+        // 游標在中間：游標前後都看得到。
+        let (s, w) = input_window("abcdefghij", 5, 6);
+        assert!(s.contains('e') && s.contains('f'), "{s}");
+        assert!(w <= 6);
+        // 換行顯示成 ⏎。
+        assert_eq!(input_window("a\nb", 3, 10).0, "a⏎b");
     }
 
     #[test]
