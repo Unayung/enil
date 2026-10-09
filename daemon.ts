@@ -12,14 +12,16 @@
 // socket 與 state 在「登入之前」就先建立：headless 跑的時候，QR 沒有終端機可印，
 // 必須透過 state 交給 UI 顯示，否則第一次登入根本做不到。
 import { createServer, connect as netConnect, type Socket } from "node:net";
+import { createHash, timingSafeEqual } from "node:crypto";
 import qrcode from "qrcode-terminal";
-import { appendFileSync, chmodSync, closeSync, existsSync, mkdirSync, readFileSync, openSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, closeSync, existsSync, mkdirSync, readFileSync, openSync, readdirSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { type ChildProcess, execFile } from "node:child_process";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, join, sep } from "node:path";
 import { type Chat, type ChatEvent, Line, type Msg } from "./line.js";
 import { NeedsQrLogin } from "./login.js";
-import { ARCHIVE_FILE, SOCK, STATE_DIR, STATE_FILE } from "./paths.js";
+import { APNS_FILE, ARCHIVE_FILE, MEDIA_DIR, PUSH_DEVICES_FILE, REMOTE_TOKEN_FILE, SOCK, STATE_DIR, STATE_FILE } from "./paths.js";
+import { voipPush, type ApnsConfig, type PushDevice } from "./apns.js";
 import { isVip, MAC_REPLY_BUTTON, macAlertArgs, vipAlertArgs } from "./vip.js";
 
 const RESYNC_MS = 60_000;      // 定期跟伺服器對齊未讀數
@@ -225,7 +227,76 @@ const handlers: Record<string, (line: Line, req: any) => Promise<unknown>> = {
     const path = String(req.path).replace(/^~(?=\/|$)/, homedir());
     return await line.sendMedia(req.chat, path);
   },
+  // 以下三個是給手機 app 的：它跟 daemon 不在同一台機器上，檔案路徑對它沒有意義。
+  //
+  // 媒體（頭像、縮圖、貼圖、download 的結果）的內容。path 是呼叫端給的，
+  // 所以只給媒體快取裡的東西，不擋就是任意讀檔。
+  async file(_line, req) {
+    const path = realpathSync(String(req.path ?? ""));
+    if (!path.startsWith(realpathSync(MEDIA_DIR) + sep)) throw new Error("只能讀媒體快取裡的檔案");
+    // ponytail: 整個檔案 base64 塞進一行。圖片沒問題，大影片會吃記憶體；常用到再做分段。
+    if (statSync(path).size > FILE_MAX) throw new Error("檔案太大，手機上不給看");
+    return { b64: readFileSync(path).toString("base64") };
+  },
+  // sendFile 的遠端版：內容跟著請求來。先落地成檔案再走同一條 sendMedia。
+  async sendData(line, req) {
+    if (!req.chat || !req.b64) throw new Error("缺 chat 或 b64");
+    // 檔名是呼叫端給的，只留安全字元，不能讓它變成路徑。放進自己的目錄是為了保住檔名：
+    // 對方看到的檔名就是 basename。
+    const name = basename(String(req.name ?? "file")).replace(/[^\w.-]/g, "_") || "file";
+    const dir = join(MEDIA_DIR, `upload-${Date.now()}`);
+    mkdirSync(dir, { recursive: true });
+    try {
+      writeFileSync(join(dir, name), Buffer.from(String(req.b64), "base64"), { mode: 0o600 });
+      return await line.sendMedia(String(req.chat), join(dir, name));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+  async "push-register"(_line, req) {
+    const token = String(req.token ?? "");
+    if (!/^[0-9a-f]{64,200}$/.test(token)) throw new Error("token 格式不對");
+    pushDevices = [...pushDevices.filter((d) => d.token !== token), { token, sandbox: Boolean(req.sandbox) }];
+    writeFileSync(PUSH_DEVICES_FILE, JSON.stringify(pushDevices), { mode: 0o600 });
+    return { registered: true };
+  },
 };
+
+const FILE_MAX = 64 * 1024 * 1024;
+
+// ------------------------------------------------------------------ 手機推播
+//
+// VIP 訊息除了桌面的彈窗，也打一通 VoIP 推播給手機，那邊用 CallKit 跳出來電畫面。
+// 要有 apns.json 才會動；沒有的話手機只在 app 開著時看得到提醒。
+
+function loadApns(): ApnsConfig | undefined {
+  if (!existsSync(APNS_FILE)) return undefined;
+  try {
+    const c = JSON.parse(readFileSync(APNS_FILE, "utf8"));
+    return { keyId: String(c.keyId), teamId: String(c.teamId), bundleId: String(c.bundleId), key: readFileSync(String(c.keyFile), "utf8") };
+  } catch (err) {
+    console.warn("apns.json 讀不了，手機推播停用：", (err as Error).message);
+    return undefined;
+  }
+}
+const apns = loadApns();
+let pushDevices: PushDevice[] = [];
+try { pushDevices = JSON.parse(readFileSync(PUSH_DEVICES_FILE, "utf8")); } catch { /* 還沒有手機登記過 */ }
+
+function ringPhones(payload: { chat: string; name: string; text: string }) {
+  if (!apns) return;
+  for (const device of pushDevices) {
+    voipPush(apns, device, payload).then(({ status, body }) => {
+      if (status === 200) return;
+      console.warn("手機推播被拒：", status, body);
+      // 410 = app 被移除或 token 換了。留著只會每次都失敗；app 下次連上會重新登記。
+      if (status === 410) {
+        pushDevices = pushDevices.filter((d) => d.token !== device.token);
+        writeFileSync(PUSH_DEVICES_FILE, JSON.stringify(pushDevices), { mode: 0o600 });
+      }
+    }).catch((err) => console.warn("手機推播發不出去：", (err as Error).message));
+  }
+}
 
 function mergeChats(chats: Chat[]) {
   const old = new Map(state.chats.map((c) => [c.mid, c]));
@@ -318,6 +389,10 @@ function onIncoming(m: Msg, caughtUp = false) {
     if (!watching) {
       const name = chat?.name ?? m.fromName;
       const alert: VipAlert = { id: m.id, chat: m.chat, name, from: m.fromName, text, time: m.time };
+      // 手機：同一個聊天室還有沒讀的提醒就不再響，連發十則不該來十通電話。
+      if (!state.vip.some((a) => a.chat === m.chat)) {
+        ringPhones({ chat: m.chat, name: name === m.fromName ? name : `${name} · ${m.fromName}`, text });
+      }
       state.vip = [...state.vip, alert].slice(-VIP_ALERTS_MAX);
       // 推送來的訊息不帶大頭貼，另外抓。抓到再寫一次 state，彈窗（omarchy 的卡片、mac 的對話框）都用它。
       const avatar = line ? line.avatar(m.from).catch(() => undefined) : Promise.resolve(undefined);
@@ -632,7 +707,24 @@ writeState();
 // 就再也登不進去。心跳要跟登入狀態無關。
 setInterval(writeState, RESYNC_MS);
 
-const server = createServer((sock: Socket) => {
+// 手機 app 的入口：同一套協定走 TCP。只聽 127.0.0.1，對 tailnet 開放交給 `tailscale serve --tcp`，
+// 這樣 daemon 不必知道 Tailscale 的位址，也不會因為 tailscaled 還沒起來就綁不上。
+// unix socket 靠檔案權限擋人；TCP 沒有那層，所以第一筆必須是 { cmd: "auth", token }。
+const REMOTE_PORT = Number(process.env.ENIL_REMOTE_PORT) || 5463;
+const REMOTE_TOKEN = existsSync(REMOTE_TOKEN_FILE) ? readFileSync(REMOTE_TOKEN_FILE, "utf8").trim() : "";
+const sha = (s: string) => createHash("sha256").update(s).digest();
+// 先雜湊再比：timingSafeEqual 要兩邊等長，而且長度本身也不該漏出去。
+const tokenOk = (t: unknown) => typeof t === "string" && timingSafeEqual(sha(t), sha(REMOTE_TOKEN));
+
+/** 從手機連進來的可以用哪些指令。QR 登入要有人拿手機掃螢幕，手機自己掃不到自己。 */
+function remoteAllows(cmd: string): boolean {
+  return cmd !== "login";
+}
+
+const NO_SESSION = new Set(["state", "login", "file", "push-register"]);
+
+const onConn = (remote: boolean) => (sock: Socket) => {
+  let authed = !remote;
   let buf = "";
   sock.on("data", async (chunk) => {
     buf += chunk;
@@ -646,6 +738,16 @@ const server = createServer((sock: Socket) => {
       try {
         const req = JSON.parse(raw);
         reqId = req.id;
+        if (!authed) {
+          if (req.cmd !== "auth" || !tokenOk(req.token)) {
+            sock.end(JSON.stringify({ ok: false, id: reqId, error: "未授權" }) + "\n");
+            return;
+          }
+          authed = true;
+          sock.write(JSON.stringify({ ok: true, id: reqId, data: { authed: true } }) + "\n");
+          continue;
+        }
+        if (remote && !remoteAllows(req.cmd)) throw new Error(`這個指令不能從遠端用：${req.cmd}`);
         // subscribe 要的是這條連線本身，handlers 拿不到，所以在這層處理。
         // 登入前就能訂：訂閱者不必等 daemon 登入完再重連。
         if (req.cmd === "subscribe") {
@@ -655,8 +757,8 @@ const server = createServer((sock: Socket) => {
         }
         const handler = handlers[req.cmd];
         if (!handler) throw new Error(`不認得的指令：${req.cmd}`);
-        // state 在登入前就能查（UI 靠它顯示 QR）；其餘指令要有 session。
-        if (req.cmd !== "state" && req.cmd !== "login" && !line) throw new Error("還沒登入");
+        // state 在登入前就能查（UI 靠它顯示 QR）；file 與 push-register 不碰 LINE；其餘指令要有 session。
+        if (!NO_SESSION.has(req.cmd) && !line) throw new Error("還沒登入");
         // id 原樣回傳：呼叫端同時發多筆時才不會把回應對錯請求。
         reply = JSON.stringify({ ok: true, id: reqId, data: await handler(line!, req) });
       } catch (err) {
@@ -667,8 +769,15 @@ const server = createServer((sock: Socket) => {
   });
   sock.on("error", () => { /* client 斷線不是 daemon 的問題 */ });
   sock.on("close", () => subscribers.delete(sock));
-});
+};
+const server = createServer(onConn(false));
 server.listen(SOCK, () => console.log(`👂 ${SOCK}`));
+if (REMOTE_TOKEN) {
+  // 開不起來（埠被占）不該拖垮 daemon：本機的消費者照常能用。
+  createServer(onConn(true))
+    .on("error", (e) => console.warn("手機入口開不起來：", e.message))
+    .listen(REMOTE_PORT, "127.0.0.1", () => console.log(`📱 127.0.0.1:${REMOTE_PORT}`));
+}
 
 /**
  * 登入分兩種，只有一種可以自動做：

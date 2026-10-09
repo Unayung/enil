@@ -22,6 +22,12 @@ export const STORAGE_FILE = join(STATE_DIR, "storage.json");
 export const ARCHIVE_FILE = join(STATE_DIR, "archive.jsonl");
 /** 群發紀錄，一次送出一行。同一個 --tag 重跑時靠它跳過已送出的對象。 */
 export const SENT_FILE = join(STATE_DIR, "sent.jsonl");
+/** 手機 app 連進來用的密碼。這個檔不存在，daemon 就不開 TCP 入口。 */
+export const REMOTE_TOKEN_FILE = join(STATE_DIR, "remote-token");
+/** APNs 的設定 { keyId, teamId, bundleId, keyFile }。沒有這個檔就不推手機。 */
+export const APNS_FILE = join(STATE_DIR, "apns.json");
+/** 手機 app 登記的推播 token，[{ token, sandbox }]。 */
+export const PUSH_DEVICES_FILE = join(STATE_DIR, "push-devices.json");
 
 /**
  * 建好 STATE_DIR，並把舊的 ./storage.json 搬進去。

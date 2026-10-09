@@ -150,6 +150,25 @@ mid）。VIP 的新訊息一定要被看到，所以提醒是 daemon 發的，TU
 
 正開著那個聊天室、而且 TUI 有焦點時不提醒。
 
+## 手機入口
+
+iPhone app（[enil-ios](../enil-ios)）不自己登入 LINE，它連回 daemon。同一套協定走 TCP，
+差別只有第一筆必須是 `{"cmd":"auth","token":"…"}`。daemon 只聽 `127.0.0.1`，對 tailnet 開放交給 Tailscale：
+
+```bash
+openssl rand -hex 32 > ~/.local/state/enil/remote-token && chmod 600 ~/.local/state/enil/remote-token
+systemctl --user restart enil
+tailscale serve --bg --tcp 5463 tcp://127.0.0.1:5463
+```
+
+沒有 `remote-token` 就不開這個入口。埠用 `ENIL_REMOTE_PORT` 改。拿到 token 的人能讀寫整個 LINE 帳號。
+
+VIP 訊息要在手機上跳來電畫面的話，另外放一份 `~/.local/state/enil/apns.json`：
+
+```json
+{ "keyId": "…", "teamId": "…", "bundleId": "io.github.unayung.Enil", "keyFile": "/path/to/AuthKey_….p8" }
+```
+
 ## omarchy 外掛
 
 在獨立的 repo：**[omarchy-line](https://github.com/Unayung/omarchy-line)**
@@ -204,6 +223,9 @@ omarchy plugin add https://github.com/Unayung/omarchy-line.git --enable
 | `download` | `messageId` `preview` | `{path}` |
 | `squares` | — | 加入的 OpenChat |
 | `squareHistory` | `chat` `count` | 某個 OpenChat 的訊息 |
+| `file` | `path` | `{b64}`：媒體快取裡某個檔案的內容。給不在同一台機器上的消費者（手機）用 |
+| `sendData` | `chat` `name` `b64` | `sendFile` 的遠端版，檔案內容跟著請求來 |
+| `push-register` | `token` `sandbox` | 登記手機的 VoIP 推播 token |
 | `subscribe` | — | 見下 |
 
 `subscribe` 把那條連線變成推送用的：先回一行 `{ok:true}`，之後每有事件就寫一行
