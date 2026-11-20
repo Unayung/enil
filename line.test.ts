@@ -12,7 +12,7 @@ import assert from "node:assert";
 import { createHash, createHmac } from "node:crypto";
 // 動態 import：靜態 import 會被提到最前面，比上面那行設環境變數還早執行，
 // 那樣 paths.js 算出來的就是真的狀態目錄。
-const { chunkedMac, flexOf, safeExt, mentionsOf, mentionMeta, reactionName, stickerOf, packOf } = await import("./line.js");
+const { chunkedMac, rejectEmptyUpload, flexOf, safeExt, mentionsOf, mentionMeta, reactionName, stickerOf, packOf } = await import("./line.js");
 
 const flex = flexOf(JSON.stringify({
   type: "bubble",
@@ -146,6 +146,14 @@ assert.deepEqual(packOf({ "1": "6427", "11": "Doraemon", "21": 2, "93": { "1": {
 assert.equal(packOf({ "1": "6427", "21": 1, "93": { "1": { "1": [] } } }), undefined); // 沒有貼圖
 assert.equal(packOf({ "1": "x/../", "21": 1, "93": { "1": { "1": [{ "1": 1, "2": 1 }] } } }), undefined); // id 不是數字
 assert.equal(packOf({ "1": "1", "21": 1, "93": { "1": { "1": [{ "1": 1, "2": 99999 }] } } }), undefined); // 張數不合理
+
+// 上傳：linejs 被拒時回空的 objId，要變成錯誤（不然一般上傳「成功」、E2EE 拿 OID: "" 送出）。
+{
+  const obs = { uploadObjectForService: async (o: any) => ({ objId: o.ok ? "abc" : "", headers: new Headers() }) };
+  rejectEmptyUpload(obs);
+  assert.equal((await obs.uploadObjectForService({ ok: true })).objId, "abc");
+  await assert.rejects(obs.uploadObjectForService({ ok: false }), /objId/);
+}
 
 // 憑證檔：寫完是 0600、重開讀得回來；壞檔要丟錯，不能當成空的再蓋掉。
 {

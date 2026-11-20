@@ -230,6 +230,20 @@ function acceptChunkedMac(e2ee: any) {
   };
 }
 
+/**
+ * linejs 的 uploadObjectForService 不看 HTTP 狀態：上傳被拒時照樣回傳，objId 是空字串。
+ * 一般上傳因此「成功」、訊息卻沒出去（也就不會退到 E2EE）；E2EE 那條則會拿 OID: "" 去 sendMessage。
+ * 兩條都經過這個實例方法，所以在這裡擋。3.6.5 仍未修。
+ */
+export function rejectEmptyUpload(obs: any) {
+  const orig = obs.uploadObjectForService.bind(obs);
+  obs.uploadObjectForService = async (options: any) => {
+    const res = await orig(options);
+    if (!res?.objId) throw new Error(`上傳被拒（沒拿到 objId）：${options?.obsPath ?? ""}`);
+    return res;
+  };
+}
+
 /** 副檔名只收英數。檔名是對方給的，原樣拼進路徑的話 "a./../../x" 會寫到 media 目錄外面。 */
 export function safeExt(name: string | undefined): string | undefined {
   return name?.match(/\.([A-Za-z0-9]{1,10})$/)?.[1];
@@ -283,6 +297,7 @@ export class Line {
     await keepAuthToken(self.#client);
     self.#base = self.#client.base;
     acceptChunkedMac(self.#base.e2ee);
+    rejectEmptyUpload(self.#base.obs);
     const p = await self.#client.getMyProfile();
     self.me = { mid: p.mid, displayName: p.displayName };
     self.#names.set(p.mid, p.displayName);
