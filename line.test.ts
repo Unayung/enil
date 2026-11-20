@@ -147,4 +147,20 @@ assert.equal(packOf({ "1": "6427", "21": 1, "93": { "1": { "1": [] } } }), undef
 assert.equal(packOf({ "1": "x/../", "21": 1, "93": { "1": { "1": [{ "1": 1, "2": 1 }] } } }), undefined); // id 不是數字
 assert.equal(packOf({ "1": "1", "21": 1, "93": { "1": { "1": [{ "1": 1, "2": 99999 }] } } }), undefined); // 張數不合理
 
+// 憑證檔：寫完是 0600、重開讀得回來；壞檔要丟錯，不能當成空的再蓋掉。
+{
+  const { SafeFileStorage } = await import("./storage.js");
+  const { readFileSync, statSync, writeFileSync, chmodSync } = await import("node:fs");
+  const f = join(mkdtempSync(join(tmpdir(), "enil-storage-")), "storage.json");
+  await new SafeFileStorage(f).set("refreshToken", "r1");
+  assert.equal(statSync(f).mode & 0o777, 0o600);
+  assert.equal(await new SafeFileStorage(f).get("refreshToken"), "r1");
+  chmodSync(f, 0o644); // 舊檔權限太寬：讀進來就收緊
+  new SafeFileStorage(f);
+  assert.equal(statSync(f).mode & 0o777, 0o600);
+  writeFileSync(f, '{"refreshToken":"r');
+  assert.throws(() => new SafeFileStorage(f));
+  assert.equal(readFileSync(f, "utf8"), '{"refreshToken":"r'); // 殘骸留著給人看
+}
+
 console.log("ok");

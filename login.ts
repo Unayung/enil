@@ -1,14 +1,14 @@
 // 登入：優先用 storage 裡的 refreshToken 換 token，換不到才掃 QR。
 import { Client } from "@evex/linejs";
 import { BaseClient } from "@evex/linejs/base";
-import { FileStorage } from "@evex/linejs/storage";
 import qrcode from "qrcode-terminal";
 import { STORAGE_FILE, prepareStorage } from "./paths.js";
+import { SafeFileStorage } from "./storage.js";
 import nacl from "tweetnacl";
 import crypto from "node:crypto";
 
 prepareStorage();                   // 建目錄、把舊的 ./storage.json 搬過來
-export const storage = new FileStorage(STORAGE_FILE);
+export const storage = new SafeFileStorage(STORAGE_FILE); // 不用 linejs 的 FileStorage，理由見 storage.ts
 // legy.encrypted：linejs 預設 "auto"，帶 v3 JWT 的 talk 呼叫會包進 legy.line-apps.com/enc，
 // 但 LINE 現在對 /enc 一律回空的 404（2026-11-20 實測，跟不存在的路徑一樣）。症狀是 QR 掃完
 // getProfile 就 404，noop 也 404。關掉只是少一層 AES 外殼，傳輸仍是 HTTPS，E2EE 不受影響。
