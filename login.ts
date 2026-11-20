@@ -9,7 +9,11 @@ import crypto from "node:crypto";
 
 prepareStorage();                   // 建目錄、把舊的 ./storage.json 搬過來
 export const storage = new FileStorage(STORAGE_FILE);
-const init = { device: "ANDROIDSECONDARY", storage } as const; // 次要裝置登入，手機維持主裝置
+// legy.encrypted：linejs 預設 "auto"，帶 v3 JWT 的 talk 呼叫會包進 legy.line-apps.com/enc，
+// 但 LINE 現在對 /enc 一律回空的 404（2026-11-20 實測，跟不存在的路徑一樣）。症狀是 QR 掃完
+// getProfile 就 404，noop 也 404。關掉只是少一層 AES 外殼，傳輸仍是 HTTPS，E2EE 不受影響。
+// 3.6.5 預設仍是 "auto"，升版也要留著。
+const init = { device: "ANDROIDSECONDARY", storage, legy: { encrypted: false } } as const; // 次要裝置登入，手機維持主裝置
 
 /**
  * QR 與 PIN 要交給呼叫端 —— daemon 沒有終端機可印，得把它們寫進 state 給 UI。
