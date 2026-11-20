@@ -5,6 +5,7 @@
 // 登入會拿 refreshToken 換 token，而 LINE 的 refreshToken 是 rotate 的
 // （JWT 標了 rot:ROTATE，回應帶回新的、舊的作廢）。兩個 process 同時啟動
 // 會互相洗掉對方的憑證，最後退回掃 QR。要多個消費者就架一個 daemon 持有唯一 session。
+import { execFileSync } from "node:child_process";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { LINEStruct } from "@evex/linejs/thrift";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -263,6 +264,43 @@ export function callerOf(op: any, me: string | undefined, now = Date.now()): str
   return caller;
 }
 
+/**
+ * 協商金鑰的錯誤裡，只有這兩種代表「對方就是不收 E2EE，送明文是對的」（linejs 的 e2ee/mod.ts：
+ * negotiate 回 specVersion -1 → "Not support E2EE"，message 是那個 mid；群組沒開 → E2EE_RETRY_PLAIN）。
+ * mid 要對上：群組金鑰的協商可能順便問到建立者的金鑰，那個人不收不代表這個聊天室不收。
+ */
+export function plainAllowed(err: unknown, to: string): boolean {
+  const e = err as { name?: unknown; type?: unknown; message?: unknown; data?: { code?: unknown } } | null;
+  if (!e || typeof e !== "object") return false;
+  return ((e.type ?? e.name) === "Not support E2EE" && e.message === to) || e.data?.code === "E2EE_RETRY_PLAIN";
+}
+
+/** 影片長度（毫秒）。不給的話 linejs 填 1919，對方看到的長度一律約 1 秒。量不到就不給。 */
+function videoDurationMs(path: string): number | undefined {
+  try {
+    const s = execFileSync("ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
+      { timeout: 15_000, encoding: "utf8" });
+    const ms = Math.round(Number(s.trim()) * 1000);
+    return Number.isSafeInteger(ms) && ms > 0 ? ms : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** E2EE 媒體的預覽：480px 的 JPEG。縮不出來就不給，linejs 會退回拿原檔當預覽（只是傳得多）。 */
+function previewOf480(path: string, oType: "image" | "video"): Blob | undefined {
+  try {
+    const out = oType === "video"
+      ? execFileSync("ffmpeg", ["-v", "error", "-i", path, "-frames:v", "1", "-vf", "scale='min(480,iw)':-2", "-f", "image2", "-c:v", "mjpeg", "pipe:1"],
+        { timeout: 30_000, maxBuffer: 16 << 20 })
+      : execFileSync("magick", [`${path}[0]`, "-auto-orient", "-thumbnail", "480x480>", "jpg:-"],
+        { timeout: 30_000, maxBuffer: 16 << 20 });
+    return out.length ? new Blob([out], { type: "image/jpeg" }) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** 副檔名只收英數。檔名是對方給的，原樣拼進路徑的話 "a./../../x" 會寫到 media 目錄外面。 */
 export function safeExt(name: string | undefined): string | undefined {
   return name?.match(/\.([A-Za-z0-9]{1,10})$/)?.[1];
@@ -481,12 +519,9 @@ export class Line {
       return;
     }
     const meta = { MENTION: mentionMeta(mentions) };
-    try {
-      await this.#base.talk.sendMessage({ to: chatMid, text, contentMetadata: meta });
-    } catch {
-      // E2EE 聊天室：明文送會被拒，改加密。metadata 留在外面（linejs 只加密 text）。
-      await this.#base.talk.sendMessage({ to: chatMid, text, contentMetadata: meta, e2ee: true });
-    }
+    // metadata 留在外面（linejs 只加密 text）。先決定路線再送一次，理由同 sendMedia。
+    const e2ee = await this.#encrypted(chatMid);
+    await this.#base.talk.sendMessage({ to: chatMid, text, contentMetadata: meta, e2ee });
   }
 
   /**
@@ -643,8 +678,8 @@ export class Line {
 
   /**
    * 送出本機檔案。上傳即送出 —— 兩條路徑都會自己建訊息。
-   * E2EE 聊天室要走另一條，但沒有可靠的事前判斷，所以照 linejs 送文字的作法：
-   * 先試一般的，失敗才改 E2EE 重來。
+   * 走哪條由 #encrypted 事先決定（以前是先試明文、失敗改 E2EE，會重複送、也可能把
+   * E2EE 聊天室的媒體明文送出）。作法參考 frankekn/omarchy-line #17。
    */
   async sendMedia(chatMid: string, filePath: string): Promise<{ oType: string; e2ee: boolean }> {
     if (!existsSync(filePath)) throw new Error(`檔案不存在：${filePath}`);
@@ -652,12 +687,31 @@ export class Line {
     const mime = MIME[extname(filePath).toLowerCase()] ?? "application/octet-stream";
     const oType = objTypeOf(mime);
     const blob = new Blob([readFileSync(filePath)], { type: mime });
+    const durationMs = oType === "video" ? videoDurationMs(filePath) : undefined;
+    // 先問清楚走哪條路，之後出錯一律不換路重送：上傳本身會送出訊息，
+    // 「明文其實成功、只是回應掉了」再改 E2EE 重傳 = 對方收到兩份。
+    const e2ee = await this.#encrypted(chatMid);
+    if (e2ee) {
+      // 不給 preview 的話 linejs 會把整份加密原檔當預覽再傳一次（大圖上傳量加倍）。
+      const preview = oType === "image" || oType === "video" ? previewOf480(filePath, oType) : undefined;
+      await this.#base.obs.uploadMediaByE2EE({ data: blob, oType, to: chatMid, filename: name, preview, durationMs });
+    } else {
+      await this.#base.obs.uploadObjTalk(chatMid, oType, blob, undefined, name, durationMs);
+    }
+    return { oType, e2ee };
+  }
+
+  /**
+   * 送之前先協商金鑰，決定加不加密。協商得到就加密；只有 LINE 明確說對方不收 E2EE 才走明文；
+   * 其餘錯誤（網路、金鑰、帳號被限制）照樣丟出 —— 不能因為一個無關的錯誤就改成不加密送出。
+   */
+  async #encrypted(to: string): Promise<boolean> {
     try {
-      await this.#base.obs.uploadObjTalk(chatMid, oType, blob, undefined, name);
-      return { oType, e2ee: false };
+      await this.#base.e2ee.getE2EELocalPublicKey(to);
+      return true;
     } catch (err) {
-      await this.#base.obs.uploadMediaByE2EE({ data: blob, oType, to: chatMid, filename: name });
-      return { oType, e2ee: true };
+      if (plainAllowed(err, to)) return false;
+      throw err;
     }
   }
 

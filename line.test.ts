@@ -12,7 +12,7 @@ import assert from "node:assert";
 import { createHash, createHmac } from "node:crypto";
 // 動態 import：靜態 import 會被提到最前面，比上面那行設環境變數還早執行，
 // 那樣 paths.js 算出來的就是真的狀態目錄。
-const { callerOf, chunkedMac, rejectEmptyUpload, flexOf, safeExt, mentionsOf, mentionMeta, reactionName, stickerOf, packOf } = await import("./line.js");
+const { callerOf, plainAllowed, chunkedMac, rejectEmptyUpload, flexOf, safeExt, mentionsOf, mentionMeta, reactionName, stickerOf, packOf } = await import("./line.js");
 
 const flex = flexOf(JSON.stringify({
   type: "bubble",
@@ -175,6 +175,17 @@ assert.equal(packOf({ "1": "1", "21": 1, "93": { "1": { "1": [{ "1": 1, "2": 999
   assert.equal(callerOf(op({ param1: "c" + "a".repeat(32) }), me, now), undefined); // 不是個人
   assert.equal(callerOf(op({ type: "CANCEL_CALL" }), me, now), undefined);
   assert.equal(callerOf(op({ param3: "" }), me, now), u); // 沒細節：當成 1:1
+}
+
+// 送出路線：只有 LINE 明確說對方不收 E2EE 才送明文；其他錯誤不能變成「不加密送出」。
+{
+  const notSupport = (mid: string) => Object.assign(new Error(mid), { name: "Not support E2EE", type: "Not support E2EE" });
+  assert.equal(plainAllowed(notSupport("u1"), "u1"), true);
+  assert.equal(plainAllowed(notSupport("u9"), "c1"), false); // 群組協商時問到的是別人
+  assert.equal(plainAllowed({ type: "RequestError", message: "x", data: { code: "E2EE_RETRY_PLAIN" } }, "c1"), true);
+  assert.equal(plainAllowed(new TypeError("fetch failed"), "u1"), false);
+  assert.equal(plainAllowed({ data: { code: "ABUSE_BLOCK" } }, "u1"), false);
+  assert.equal(plainAllowed(undefined, "u1"), false);
 }
 
 // 憑證檔：寫完是 0600、重開讀得回來；壞檔要丟錯，不能當成空的再蓋掉。
