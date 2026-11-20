@@ -97,6 +97,14 @@ assert.equal(safeExt("a.sh\n"), undefined);
   assert.equal(isVip("u1"), true);
   assert.equal(isVip("c2"), true);
   assert.equal(isVip("u"), false); // 整行比對，不是前綴
+  const { setVip, vipList } = await import("./vip.js");
+  assert.deepEqual(vipList(), ["u1", "c2"]);
+  assert.deepEqual(setVip("u3", true), ["u1", "c2", "u3"]);
+  assert.deepEqual(setVip("u3", true), ["u1", "c2", "u3"]); // 設兩次不會重複
+  assert.deepEqual(setVip("u1", false), ["c2", "u3"]);
+  assert.equal(isVip("u1"), false);
+  assert.throws(() => setVip("u9\nu1", true)); // 換行不能混進名單
+  assert.deepEqual(vipList(), ["c2", "u3"]);
   rmSync(process.env.ENIL_STATE_DIR!, { recursive: true });
 }
 

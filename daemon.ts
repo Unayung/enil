@@ -21,8 +21,8 @@ import { basename, join, sep } from "node:path";
 import { type Chat, type ChatEvent, Line, type Msg } from "./line.js";
 import { NeedsQrLogin } from "./login.js";
 import { APNS_FILE, ARCHIVE_FILE, MEDIA_DIR, PUSH_DEVICES_FILE, REMOTE_TOKEN_FILE, SOCK, STATE_DIR, STATE_FILE } from "./paths.js";
-import { voipPush, type ApnsConfig, type PushDevice } from "./apns.js";
-import { isVip, MAC_REPLY_BUTTON, macAlertArgs, vipAlertArgs } from "./vip.js";
+import { activityPayload, apnsPush, voipPush, type ApnsConfig, type PushDevice } from "./apns.js";
+import { isVip, MAC_REPLY_BUTTON, macAlertArgs, setVip, vipAlertArgs, vipList } from "./vip.js";
 
 const RESYNC_MS = 60_000;      // 定期跟伺服器對齊未讀數
 const SQUARE_MS = 10_000;      // OpenChat 只能自己拉，理由見 line.ts squareMessages()
@@ -83,6 +83,7 @@ function writeState() {
   const tmp = `${STATE_FILE}.tmp`;
   writeFileSync(tmp, JSON.stringify(state, null, 2));
   renameSync(tmp, STATE_FILE);
+  syncActivities();
 }
 
 const QRENCODE_HINT = "沒裝 qrencode（Arch: pacman -S qrencode、Debian/Ubuntu: apt install qrencode、macOS: brew install qrencode）";
@@ -253,11 +254,22 @@ const handlers: Record<string, (line: Line, req: any) => Promise<unknown>> = {
       rmSync(dir, { recursive: true, force: true });
     }
   },
+  // VIP 名單。帶 chat 就是設定或取消（on），不帶就只是讀。
+  async vip(_line, req) {
+    return req.chat ? setVip(String(req.chat), Boolean(req.on)) : vipList();
+  },
   async "push-register"(_line, req) {
     const token = String(req.token ?? "");
     if (!/^[0-9a-f]{64,200}$/.test(token)) throw new Error("token 格式不對");
-    pushDevices = [...pushDevices.filter((d) => d.token !== token), { token, sandbox: Boolean(req.sandbox) }];
-    writeFileSync(PUSH_DEVICES_FILE, JSON.stringify(pushDevices), { mode: 0o600 });
+    // start／activity 是 Live Activity 的兩種 token，app 拿到就一起報上來；沒有就不給。
+    const hex = (v: unknown) => (typeof v === "string" && /^[0-9a-f]{64,400}$/.test(v) ? v : undefined);
+    pushDevices = [
+      ...pushDevices.filter((d) => d.token !== token),
+      { token, sandbox: Boolean(req.sandbox), start: hex(req.start), activity: hex(req.activity) },
+    ];
+    savePushDevices();
+    // 卡片的 token 可能是剛拿到的（遠端啟動之後 app 才被叫起來回報），把最新內容補上去。
+    syncActivities(true);
     return { registered: true };
   },
 };
@@ -283,16 +295,73 @@ const apns = loadApns();
 let pushDevices: PushDevice[] = [];
 try { pushDevices = JSON.parse(readFileSync(PUSH_DEVICES_FILE, "utf8")); } catch { /* 還沒有手機登記過 */ }
 
+/** 同一個聊天室多久內不打第二通。只記在記憶體：重啟後第一則會再響一次，那是對的。 */
+const RING_COOLDOWN_MS = 60_000;
+const lastRing = new Map<string, number>();
+
+function savePushDevices() {
+  writeFileSync(PUSH_DEVICES_FILE, JSON.stringify(pushDevices), { mode: 0o600 });
+}
+
+// Live Activity：鎖定畫面上一張卡片（手錶也看得到），顯示最新一則 VIP 提醒，留到讀掉為止。
+// 跟 state.vip 對齊：有提醒就要有卡片，沒提醒就收掉。writeState 每次都會來問，所以用簽章擋掉沒變的。
+let activitySig = "";
+/** 已經送過「遠端啟動」、還在等 app 回報卡片 token 的手機。等的期間不能再啟動一次，會變兩張。 */
+const starting = new Set<string>();
+
+function syncActivities(force = false) {
+  if (!apns) return;
+  const sig = state.vip.map((a) => a.id).join(",");
+  if (!force && sig === activitySig) return;
+  // 提醒變多才出聲；變少（讀掉一部分）或只是補內容就安靜更新。
+  const louder = !force && state.vip.length > (activitySig ? activitySig.split(",").length : 0);
+  activitySig = sig;
+  const last = state.vip[state.vip.length - 1];
+  const card = last
+    ? { chat: last.chat, name: last.name === last.from ? last.name : `${last.name} · ${last.from}`, text: last.text, count: state.vip.length }
+    : { chat: "", name: "", text: "", count: 0 };
+  for (const device of pushDevices) {
+    const send = (token: string, event: "start" | "update" | "end") =>
+      apnsPush(apns, device.sandbox, token, "liveactivity", activityPayload(event, card, louder)).then(({ status, body }) => {
+        if (status === 200) return console.log(`🪧 Live Activity ${event}：${card.name || "收起"}`);
+        console.warn(`Live Activity ${event} 被拒：`, status, body);
+        // token 失效（卡片被滑掉、app 被移除）：忘掉它，下次從頭來。
+        if (status === 410 || /BadDeviceToken|Unregistered/.test(body)) {
+          if (event === "start") device.start = undefined; else device.activity = undefined;
+          starting.delete(device.token);
+          savePushDevices();
+        }
+      }).catch((err) => console.warn("Live Activity 推不出去：", (err as Error).message));
+
+    if (!last) {
+      starting.delete(device.token);
+      if (device.activity) {
+        void send(device.activity, "end");
+        device.activity = undefined;
+        savePushDevices();
+      }
+    } else if (device.activity) {
+      starting.delete(device.token);
+      void send(device.activity, "update");
+    } else if (device.start && !starting.has(device.token)) {
+      // ponytail: app 沒被系統叫起來回報 token 的話，這張卡片之後更新不到、也收不掉，
+      // 要等使用者開 app（app 會自己收）。常發生的話改成每則都重新啟動。
+      starting.add(device.token);
+      void send(device.start, "start");
+    }
+  }
+}
+
 function ringPhones(payload: { chat: string; name: string; text: string }) {
   if (!apns) return;
   for (const device of pushDevices) {
     voipPush(apns, device, payload).then(({ status, body }) => {
-      if (status === 200) return;
+      if (status === 200) return console.log(`📞 已打給手機：${payload.name}`);
       console.warn("手機推播被拒：", status, body);
       // 410 = app 被移除或 token 換了。留著只會每次都失敗；app 下次連上會重新登記。
       if (status === 410) {
         pushDevices = pushDevices.filter((d) => d.token !== device.token);
-        writeFileSync(PUSH_DEVICES_FILE, JSON.stringify(pushDevices), { mode: 0o600 });
+        savePushDevices();
       }
     }).catch((err) => console.warn("手機推播發不出去：", (err as Error).message));
   }
@@ -386,11 +455,14 @@ function onIncoming(m: Msg, caughtUp = false) {
   const mentionsMe = !!state.me && !!m.mentions?.includes(state.me.mid);
   if (m.from !== state.me?.mid && (isVip(m.chat) || mentionsMe)) {
     const watching = viewing && viewing.chat === m.chat && Date.now() < viewing.until;
+    // 沒提醒的原因從外面看不出來（手機沒響是沒打、還是打了沒到？），所以留一行。
+    if (watching) console.log(`VIP 訊息，但有介面回報正在看那個聊天室，不提醒：${chat?.name ?? m.fromName}`);
     if (!watching) {
       const name = chat?.name ?? m.fromName;
       const alert: VipAlert = { id: m.id, chat: m.chat, name, from: m.fromName, text, time: m.time };
-      // 手機：同一個聊天室還有沒讀的提醒就不再響，連發十則不該來十通電話。
-      if (!state.vip.some((a) => a.chat === m.chat)) {
+      // 手機：同一個聊天室剛響過就先不響，連發十則不該來十通電話；隔一陣子的新訊息要再響。
+      if (Date.now() - (lastRing.get(m.chat) ?? 0) > RING_COOLDOWN_MS) {
+        lastRing.set(m.chat, Date.now());
         ringPhones({ chat: m.chat, name: name === m.fromName ? name : `${name} · ${m.fromName}`, text });
       }
       state.vip = [...state.vip, alert].slice(-VIP_ALERTS_MAX);
@@ -691,6 +763,8 @@ mkdirSync(STATE_DIR, { recursive: true });
 try {
   const prev = JSON.parse(readFileSync(STATE_FILE, "utf8"));
   if (Array.isArray(prev.vip)) state.vip = prev.vip;
+  // 重啟不算「提醒有變」：這些上次就通報過了，不要每次重啟都再響一輪。
+  activitySig = state.vip.map((a) => a.id).join(",");
 } catch { /* 第一次跑，或檔案壞了 */ }
 try {
   await claimSocket();
@@ -721,7 +795,7 @@ function remoteAllows(cmd: string): boolean {
   return cmd !== "login";
 }
 
-const NO_SESSION = new Set(["state", "login", "file", "push-register"]);
+const NO_SESSION = new Set(["state", "login", "file", "push-register", "vip"]);
 
 const onConn = (remote: boolean) => (sock: Socket) => {
   let authed = !remote;
@@ -757,7 +831,7 @@ const onConn = (remote: boolean) => (sock: Socket) => {
         }
         const handler = handlers[req.cmd];
         if (!handler) throw new Error(`不認得的指令：${req.cmd}`);
-        // state 在登入前就能查（UI 靠它顯示 QR）；file 與 push-register 不碰 LINE；其餘指令要有 session。
+        // state 在登入前就能查（UI 靠它顯示 QR）；file、push-register、vip 不碰 LINE；其餘指令要有 session。
         if (!NO_SESSION.has(req.cmd) && !line) throw new Error("還沒登入");
         // id 原樣回傳：呼叫端同時發多筆時才不會把回應對錯請求。
         reply = JSON.stringify({ ok: true, id: reqId, data: await handler(line!, req) });

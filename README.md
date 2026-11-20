@@ -163,7 +163,7 @@ tailscale serve --bg --tcp 5463 tcp://127.0.0.1:5463
 
 沒有 `remote-token` 就不開這個入口。埠用 `ENIL_REMOTE_PORT` 改。拿到 token 的人能讀寫整個 LINE 帳號。
 
-VIP 訊息要在手機上跳來電畫面的話，另外放一份 `~/.local/state/enil/apns.json`：
+VIP 訊息要在手機上跳來電畫面的話（同一個聊天室 60 秒內只響一次），另外放一份 `~/.local/state/enil/apns.json`：
 
 ```json
 { "keyId": "…", "teamId": "…", "bundleId": "io.github.unayung.Enil", "keyFile": "/path/to/AuthKey_….p8" }
@@ -226,6 +226,7 @@ omarchy plugin add https://github.com/Unayung/omarchy-line.git --enable
 | `file` | `path` | `{b64}`：媒體快取裡某個檔案的內容。給不在同一台機器上的消費者（手機）用 |
 | `sendData` | `chat` `name` `b64` | `sendFile` 的遠端版，檔案內容跟著請求來 |
 | `push-register` | `token` `sandbox` | 登記手機的 VoIP 推播 token |
+| `vip` | `chat` `on` | VIP 名單 `[mid]`。帶 `chat` 就是設定（`on: true`）或取消，不帶只讀 |
 | `subscribe` | — | 見下 |
 
 `subscribe` 把那條連線變成推送用的：先回一行 `{ok:true}`，之後每有事件就寫一行

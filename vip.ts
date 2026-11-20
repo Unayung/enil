@@ -1,7 +1,7 @@
 // VIP 聊天室：他們的訊息一定要被看到，不管 TUI 有沒有開、有沒有焦點。
 //
 // 名單是 TUI（Ctrl-P）寫的，一行一個 mid。提醒由 daemon 發 —— 它是唯一一直在跑的。
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { STATE_DIR } from "./paths.js";
 
@@ -14,6 +14,25 @@ export function isVip(chat: string): boolean {
   } catch {
     return false; // 沒有檔案 = 沒有 VIP
   }
+}
+
+/** 名單本身，一行一個 mid。TUI 也直接讀寫這個檔，格式不能變。 */
+export function vipList(): string[] {
+  try {
+    return readFileSync(VIP_FILE, "utf8").split("\n").map((l) => l.trim()).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+/** 設定或取消 VIP，回傳改完的名單。給手機 app 用：它碰不到這台的檔案。 */
+export function setVip(chat: string, on: boolean): string[] {
+  // mid 是呼叫端給的，而檔案一行一個：不能讓它帶換行混進別的 mid。
+  if (!/^\w+$/.test(chat)) throw new Error("mid 格式不對");
+  const list = vipList().filter((m) => m !== chat);
+  if (on) list.push(chat);
+  writeFileSync(VIP_FILE, list.map((m) => m + "\n").join(""), { mode: 0o600 });
+  return list;
 }
 
 /**
