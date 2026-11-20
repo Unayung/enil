@@ -129,6 +129,8 @@ npm run line sread <squareChatMid> 20  # 讀某個 OpenChat
 訊息在 daemon 快取裡，也就是要先 `read` 過該聊天室。
 
 `SKILL.md` 同時是給 agent 用的說明（放到 `~/.claude/skills/line/` 即可）。
+設 `ENIL_READONLY=1` 時，CLI 會拒絕一切別人看得到的動作（送出、群發、標已讀、QR 登入），
+exit 3。交給 agent 做只需要讀的事時用。它只管 CLI，daemon 的 socket 不受限。
 
 LINE 伺服器對次要裝置只保留約兩週的歷史。daemon 會把收到的每則訊息存進
 `~/.local/state/enil/archive.jsonl`，那是唯一的長期紀錄，從開始跑的那天算起。

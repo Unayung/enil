@@ -11,6 +11,7 @@
 //   npx tsx cli.ts state
 //
 // 成功 exit 0 並印出 JSON；失敗 exit 1 並印出 {"ok":false,"error":...}
+// ENIL_READONLY=1 時，會送出或標已讀的指令 exit 3（見下面 readonlyBlocked）
 import { connect } from "node:net";
 import { SOCK } from "./paths.js";
 import { runBroadcast } from "./broadcast.js";
@@ -51,9 +52,22 @@ const USAGE = "用法：\n" +
   "  login                （沒有快取憑證時，觸發 QR 登入）\n" +
   "  state";
 
+// ENIL_READONLY=1：交給 agent 用時的護欄。擋掉所有別人看得到的動作 —— 送出、群發、
+// 標已讀（對方會看到「已讀」）、QR 登入（會把另一台機器踢掉）。broadcast --dry-run 只預覽，放行。
+// ponytail: 只擋 CLI。daemon 還要服務 TUI，直接連 socket 就繞得過；要真的鎖得改成 daemon 端的權限。
+const readonlyBlocked = process.env.ENIL_READONLY === "1" && (
+  ["send", "sendfile", "login"].includes(cmd) ||
+  (cmd === "broadcast" && !rest.includes("--dry-run")) ||
+  (cmd === "read" && flags.has("--read"))
+);
+if (readonlyBlocked) {
+  console.log(JSON.stringify({ ok: false, error: `ENIL_READONLY=1：不允許 ${cmd}${flags.has("--read") ? " --read" : ""}` }));
+  process.exitCode = 3;
+}
+
 // broadcast 不是「一個請求一個回應」，所以走自己的路，也自己解析帶值的旗標
 // （--tag X / --delay X）—— 下面那組 args/flags 只認得沒有值的 --x。
-if (cmd === "broadcast") {
+if (cmd === "broadcast" && !readonlyBlocked) {
   const valued = new Set(["--tag", "--delay"]);
   const optOf = (name: string) => {
     const i = rest.indexOf(`--${name}`);
@@ -87,7 +101,7 @@ if (cmd === "broadcast") {
   }
 }
 
-const req = (cmd === "broadcast" ? undefined : (() => {
+const req = (cmd === "broadcast" || readonlyBlocked ? undefined : (() => {
   switch (cmd) {
     case "chats":
       return { cmd: "chats", limit: args[0] ? Number(args[0]) : undefined, query: args[1] };
@@ -117,7 +131,7 @@ const req = (cmd === "broadcast" ? undefined : (() => {
   }
 })());
 
-if (!req && cmd !== "broadcast") {
+if (!req && cmd !== "broadcast" && !readonlyBlocked) {
   console.error(USAGE);
   process.exitCode = 2;
 }

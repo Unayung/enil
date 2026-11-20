@@ -210,6 +210,9 @@ npx tsx cli.ts chats 50 | jq -r '.[]|select(.unread>0)|"\(.unread)  \(.name)"'
 2. 有多筆符合就**停下來問使用者**，不要猜。送錯人無法挽回。
 3. 送出後用 `read <mid> 2` 確認送達，並把實際送出的內容原文回報給使用者。
 
+只需要讀的任務，用 `ENIL_READONLY=1 npx tsx cli.ts …` 跑：`send`、`sendfile`、`broadcast`
+（`--dry-run` 除外）、`read --read`、`login` 會直接拒絕並 exit 3，其他照常。
+
 ## 陷阱
 
 - **`time` 是 epoch 毫秒，`jq` 的 `strftime` 預設 UTC**。台灣時間要 `./1000+28800`。
