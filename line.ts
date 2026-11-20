@@ -244,6 +244,25 @@ export function rejectEmptyUpload(obs: any) {
   };
 }
 
+/**
+ * 1:1 來電（NOTIFIED_RECEIVED_CALL）的來電者 mid；不是要響的來電就回 undefined。
+ * param1 是來電者，param3 是 JSON，g 為真是群組通話（沒有 1:1 聊天室可以響）。
+ * 超過一分鐘的不算：daemon 重開時可能補收到漏掉的 op，那通早就不響了，LINE 一分鐘內就會放棄。
+ * 對方掛斷時沒有 CANCEL_CALL（frankekn/omarchy-line #45 實測），所以這裡只管「響」。
+ */
+export const CALL_RING_MS = 60_000;
+export function callerOf(op: any, me: string | undefined, now = Date.now()): string | undefined {
+  if (String(op?.type) !== "NOTIFIED_RECEIVED_CALL") return;
+  const caller = String(op.param1 ?? "");
+  if (!/^u[0-9a-f]{32}$/.test(caller) || caller === me) return;
+  try {
+    if (JSON.parse(String(op.param3 ?? "")).g) return;
+  } catch { /* 沒有細節可以說它是群組通話 */ }
+  const sent = Number(op.createdTime);
+  if (Number.isFinite(sent) && now - sent > CALL_RING_MS) return;
+  return caller;
+}
+
 /** 副檔名只收英數。檔名是對方給的，原樣拼進路徑的話 "a./../../x" 會寫到 media 目錄外面。 */
 export function safeExt(name: string | undefined): string | undefined {
   return name?.match(/\.([A-Za-z0-9]{1,10})$/)?.[1];

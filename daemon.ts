@@ -18,7 +18,7 @@ import { appendFileSync, chmodSync, closeSync, existsSync, mkdirSync, readFileSy
 import { type ChildProcess, execFile } from "node:child_process";
 import { homedir } from "node:os";
 import { basename, join, sep } from "node:path";
-import { type Chat, type ChatEvent, Line, type Msg } from "./line.js";
+import { callerOf, type Chat, type ChatEvent, Line, type Msg } from "./line.js";
 import { NeedsQrLogin } from "./login.js";
 import { APNS_FILE, ARCHIVE_FILE, MEDIA_DIR, PUSH_DEVICES_FILE, REMOTE_TOKEN_FILE, SOCK, STATE_DIR, STATE_FILE } from "./paths.js";
 import { activityPayload, apnsPush, voipPush, type ApnsConfig, type PushDevice } from "./apns.js";
@@ -458,26 +458,46 @@ function onIncoming(m: Msg, caughtUp = false) {
     // 沒提醒的原因從外面看不出來（手機沒響是沒打、還是打了沒到？），所以留一行。
     if (watching) console.log(`VIP 訊息，但有介面回報正在看那個聊天室，不提醒：${chat?.name ?? m.fromName}`);
     if (!watching) {
-      const name = chat?.name ?? m.fromName;
-      const alert: VipAlert = { id: m.id, chat: m.chat, name, from: m.fromName, text, time: m.time };
       // 手機：同一個聊天室剛響過就先不響，連發十則不該來十通電話；隔一陣子的新訊息要再響。
-      if (Date.now() - (lastRing.get(m.chat) ?? 0) > RING_COOLDOWN_MS) {
-        lastRing.set(m.chat, Date.now());
-        ringPhones({ chat: m.chat, name: name === m.fromName ? name : `${name} · ${m.fromName}`, text });
-      }
-      state.vip = [...state.vip, alert].slice(-VIP_ALERTS_MAX);
-      // 推送來的訊息不帶大頭貼，另外抓。抓到再寫一次 state，彈窗（omarchy 的卡片、mac 的對話框）都用它。
-      const avatar = line ? line.avatar(m.from).catch(() => undefined) : Promise.resolve(undefined);
-      void avatar.then((path) => {
-        if (path && state.vip.includes(alert)) { alert.avatar = path; writeState(); }
-      });
-      if (!hasOverlay()) alertVip(m.chat, name, m.fromName, text, avatar);
+      const ring = Date.now() - (lastRing.get(m.chat) ?? 0) > RING_COOLDOWN_MS;
+      raiseVip({ id: m.id, chat: m.chat, name: chat?.name ?? m.fromName, from: m.fromName, text, time: m.time }, m.from, ring);
     }
   }
 
   writeState();
   // 推給訂閱者。OpenChat 不走 onIncoming，所以不會被推送（見 startLogin）。
   push("message", m);
+}
+
+/** VIP 提醒：手機響（ring）、留一筆給卡片與 Live Activity、桌面彈窗。訊息與來電共用。 */
+function raiseVip(alert: VipAlert, fromMid: string, ring: boolean) {
+  const { chat, name, from, text } = alert;
+  if (ring) {
+    lastRing.set(chat, Date.now());
+    ringPhones({ chat, name: name === from ? name : `${name} · ${from}`, text });
+  }
+  state.vip = [...state.vip, alert].slice(-VIP_ALERTS_MAX);
+  // 推送來的訊息不帶大頭貼，另外抓。抓到再寫一次 state，彈窗（omarchy 的卡片、mac 的對話框）都用它。
+  const avatar = line ? line.avatar(fromMid).catch(() => undefined) : Promise.resolve(undefined);
+  void avatar.then((path) => {
+    if (path && state.vip.includes(alert)) { alert.avatar = path; writeState(); }
+  });
+  if (!hasOverlay()) alertVip(chat, name, from, text, avatar);
+}
+
+/**
+ * VIP 打來：跟 VIP 訊息同一條路。不看冷卻（剛傳「等下打給你」接著打來，還是要響），
+ * 也不看「正在看那個聊天室」—— 這裡接不了電話，盯著聊天室也該知道有人在打。
+ * 非 VIP 的來電只記一行：主手機上的官方 LINE 本來就會響。
+ */
+function onCallOp(_type: string, op: any) {
+  const caller = callerOf(op, state.me?.mid);
+  if (!caller) return;
+  const name = state.chats.find((c) => c.mid === caller)?.name ?? caller.slice(0, 10);
+  if (!isVip(caller)) return void console.log(`來電（不是 VIP，不提醒）：${name}`);
+  console.log(`📞 VIP 來電：${name}`);
+  raiseVip({ id: `call-${op.createdTime ?? Date.now()}`, chat: caller, name, from: name, text: "📞 來電", time: Date.now() }, caller, true);
+  writeState();
 }
 
 // ------------------------------------------------------------------ 事件統計
@@ -919,6 +939,7 @@ async function startLogin(force: boolean): Promise<void> {
     line.onMessage((m) => onIncoming(m));
     line.onEvents(onChatEvent);
     line.onAnyOp(tallyOp);
+    line.onAnyOp(onCallOp);
     const session = line;
     line.onTrouble((kind, detail) => {
       if (session !== line) return; // 已經被換掉的連線

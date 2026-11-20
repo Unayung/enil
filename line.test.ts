@@ -12,7 +12,7 @@ import assert from "node:assert";
 import { createHash, createHmac } from "node:crypto";
 // 動態 import：靜態 import 會被提到最前面，比上面那行設環境變數還早執行，
 // 那樣 paths.js 算出來的就是真的狀態目錄。
-const { chunkedMac, rejectEmptyUpload, flexOf, safeExt, mentionsOf, mentionMeta, reactionName, stickerOf, packOf } = await import("./line.js");
+const { callerOf, chunkedMac, rejectEmptyUpload, flexOf, safeExt, mentionsOf, mentionMeta, reactionName, stickerOf, packOf } = await import("./line.js");
 
 const flex = flexOf(JSON.stringify({
   type: "bubble",
@@ -162,6 +162,19 @@ assert.equal(packOf({ "1": "1", "21": 1, "93": { "1": { "1": [{ "1": 1, "2": 999
   assert.equal(refreshRejected({ message: "NOT_AUTHORIZED_DEVICE" }), true);
   assert.equal(refreshRejected(new TypeError("fetch failed")), false);
   assert.equal(refreshRejected(new Error("getaddrinfo EAI_AGAIN legy.line-apps.com")), false);
+}
+
+// 來電：只有 1:1、不是我、一分鐘內的才響。
+{
+  const u = "u" + "a".repeat(32), me = "u" + "b".repeat(32), now = 1_800_000_000_000;
+  const op = (o: object) => ({ type: "NOTIFIED_RECEIVED_CALL", param1: u, param3: '{"k":"CA"}', createdTime: String(now - 5000), ...o });
+  assert.equal(callerOf(op({}), me, now), u);
+  assert.equal(callerOf(op({ param3: '{"k":"CA","g":1}' }), me, now), undefined); // 群組通話
+  assert.equal(callerOf(op({ param1: me }), me, now), undefined);                  // 我自己（另一台裝置）
+  assert.equal(callerOf(op({ createdTime: String(now - 61_000) }), me, now), undefined); // 重開後補收到的舊 op
+  assert.equal(callerOf(op({ param1: "c" + "a".repeat(32) }), me, now), undefined); // 不是個人
+  assert.equal(callerOf(op({ type: "CANCEL_CALL" }), me, now), undefined);
+  assert.equal(callerOf(op({ param3: "" }), me, now), u); // 沒細節：當成 1:1
 }
 
 // 憑證檔：寫完是 0600、重開讀得回來；壞檔要丟錯，不能當成空的再蓋掉。
