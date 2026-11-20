@@ -155,6 +155,15 @@ assert.equal(packOf({ "1": "1", "21": 1, "93": { "1": { "1": [{ "1": 1, "2": 999
   await assert.rejects(obs.uploadObjectForService({ ok: false }), /objId/);
 }
 
+// refresh 失敗：伺服器拒絕的要人掃 QR；其他（網路）自動重試。
+{
+  const { refreshRejected } = await import("./login.js");
+  assert.equal(refreshRejected(new Error('refresh -> {"errorCode":"INVALID_REQUEST","reasonCode":3}')), true);
+  assert.equal(refreshRejected({ message: "NOT_AUTHORIZED_DEVICE" }), true);
+  assert.equal(refreshRejected(new TypeError("fetch failed")), false);
+  assert.equal(refreshRejected(new Error("getaddrinfo EAI_AGAIN legy.line-apps.com")), false);
+}
+
 // 憑證檔：寫完是 0600、重開讀得回來；壞檔要丟錯，不能當成空的再蓋掉。
 {
   const { SafeFileStorage } = await import("./storage.js");

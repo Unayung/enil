@@ -862,6 +862,16 @@ if (REMOTE_TOKEN) {
  */
 let loggingIn = false;
 
+/**
+ * 開機時網路常常比 daemon 晚到：refresh 只試一次的話，就停在 idle 等人手動重啟。
+ * 只重試「可能是網路」的失敗（NeedsQrLogin.retryable），被伺服器拒絕的不試 —— 那要人掃 QR。
+ * 重試只走快取 token 續期，不會產 QR（見上面「需不需要人在場」）。
+ */
+const RETRY_MIN_MS = 10_000;
+const RETRY_MAX_MS = 5 * 60_000;
+let retryDelay = RETRY_MIN_MS;
+let retryTimer: NodeJS.Timeout | undefined;
+
 async function startLogin(force: boolean): Promise<void> {
   if (loggingIn || line) return;
   loggingIn = true;
@@ -900,6 +910,8 @@ async function startLogin(force: boolean): Promise<void> {
     // line 卻留著，之後每次按登入都被開頭的 `if (line) return` 吞掉，TUI 永遠等不到 QR；
     // 推送的監聽也沒掛上，新訊息只能靠對帳補抓（實際發生過）。
     line = client;
+    clearTimeout(retryTimer);
+    retryDelay = RETRY_MIN_MS;
     clearQr();
     state.me = line.me;
     state.login = { status: "ok" };
@@ -932,6 +944,12 @@ async function startLogin(force: boolean): Promise<void> {
       const reason = err instanceof NeedsQrLogin ? err.reason : undefined;
       state.login = reason ? { status: "idle", error: reason } : { status: "idle" };
       console.log(reason ?? "沒有可用的憑證。開 enil 登入，或跑 cli.ts login。");
+      if (err instanceof NeedsQrLogin && err.retryable) {
+        console.log(`${Math.round(retryDelay / 1000)} 秒後再試一次`);
+        clearTimeout(retryTimer);
+        retryTimer = setTimeout(() => void startLogin(false), retryDelay);
+        retryDelay = Math.min(retryDelay * 2, RETRY_MAX_MS);
+      }
     } else {
       console.warn("登入失敗：", message);
       state.login = { status: "error", error: message + "（再按一次登入可重試）" };

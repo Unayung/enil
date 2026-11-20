@@ -34,8 +34,13 @@ export interface LoginOptions {
 
 /** 快取憑證不可用、且呼叫端沒允許 QR 時丟這個。 */
 export class NeedsQrLogin extends Error {
-  /** reason：給人看的原因（快取憑證為什麼不能用）。沒有就是根本沒有快取憑證。 */
-  constructor(readonly reason?: string) { super(reason ?? "需要 QR 登入（沒有可用的快取憑證）"); }
+  /**
+   * reason：給人看的原因（快取憑證為什麼不能用）。沒有就是根本沒有快取憑證。
+   * retryable：憑證可能還是好的、只是這次沒換成（多半是網路），晚點再試就好，不必掃 QR。
+   */
+  constructor(readonly reason?: string, readonly retryable = false) {
+    super(reason ?? "需要 QR 登入（沒有可用的快取憑證）");
+  }
 }
 
 /**
@@ -43,13 +48,17 @@ export class NeedsQrLogin extends Error {
  * 別台機器登入了 enil —— LINE 對次要裝置有上限，後登入的會把先登入的踢掉；網路問題則是
  * 憑證還好好的，不該叫人重掃 QR。
  */
+/** 伺服器明確拒絕了這份憑證：再試也一樣，要重新掃 QR。其餘（逾時、DNS、連不上）都可能只是網路。 */
+const REJECTED = /INVALID_REQUEST|NOT_AUTHORIZED_DEVICE|LOGGED_OUT|AUTHENTICATION_FAILED/;
+export const refreshRejected = (err: unknown) => REJECTED.test(String((err as Error)?.message ?? err));
+
 export function refreshFailureReason(err: unknown): string {
   const msg = String((err as Error)?.message ?? err);
-  if (/INVALID_REQUEST|NOT_AUTHORIZED_DEVICE|LOGGED_OUT|AUTHENTICATION_FAILED/.test(msg)) {
+  if (refreshRejected(err)) {
     return "這台的登入已被取消（可能在別台機器登入了 enil，或在手機上把這個裝置登出了）。" +
       "要在這台用就重新登入 —— 會把另一台踢掉。";
   }
-  return `換發憑證失敗（${msg.slice(0, 120)}）。如果是網路問題，網路恢復後重啟 daemon 即可，不必重新登入。`;
+  return `換發憑證失敗（${msg.slice(0, 120)}）。會自動重試，網路恢復後就會連上，不必重新登入。`;
 }
 
 const terminalHandlers: Required<LoginHandlers> = {
@@ -159,8 +168,8 @@ export async function login(
   opts: LoginOptions = {},
 ): Promise<Client> {
   const qrAllowed = opts.qrAllowed ?? false;
-  const needQr = (reason?: string) => {
-    if (!qrAllowed) throw new NeedsQrLogin(reason);
+  const needQr = (reason?: string, retryable = false) => {
+    if (!qrAllowed) throw new NeedsQrLogin(reason, retryable);
     return qrLogin(handlers);
   };
   // E2EE 金鑰只在 QR 登入時更新，所以要強迫走那條路時用：LINE_FORCE_QR=1
@@ -183,7 +192,7 @@ export async function login(
     return new Client(base);
   } catch (err) {
     console.warn("⚠️  refresh 失敗：", (err as Error)?.message ?? err);
-    return needQr(refreshFailureReason(err));
+    return needQr(refreshFailureReason(err), !refreshRejected(err));
   }
 }
 
