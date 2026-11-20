@@ -188,6 +188,20 @@ assert.equal(packOf({ "1": "1", "21": 1, "93": { "1": { "1": [{ "1": 1, "2": 999
   assert.equal(plainAllowed(undefined, "u1"), false);
 }
 
+// archive：伺服器只留兩週，更早的從自己存的補。舊到新、同一則只算一次、只看那個聊天室。
+{
+  const { olderFrom, timeIn } = await import("./archive.js");
+  const m = (id: string, chat: string, time: number) => JSON.stringify({ id, chat, time, text: id });
+  const lines = [m("1", "c1", 100), m("2", "c2", 150), m("3", "c1", 200), m("3", "c1", 200), "{壞掉", m("4", "c1", 300), m("5", "c1", 400), ""];
+  const ids = (xs: { id: string }[]) => xs.map((x) => x.id).join(",");
+  assert.equal(ids(olderFrom(lines, "c1", 300, 10, new Set())), "1,3,4");      // ≤ edge、去重、跳過別的聊天室與壞行
+  assert.equal(ids(olderFrom(lines, "c1", 300, 2, new Set())), "3,4");         // 取最接近 edge 的那幾則
+  assert.equal(ids(olderFrom(lines, "c1", 300, 10, new Set(["4"]))), "1,3");   // 伺服器已經給過的不重複
+  assert.equal(olderFrom(lines, "c1", 300, 1, new Set())[0].archived, true);
+  assert.equal(timeIn(lines, "4"), 300);
+  assert.equal(timeIn(lines, "9"), undefined);
+}
+
 // 憑證檔：寫完是 0600、重開讀得回來；壞檔要丟錯，不能當成空的再蓋掉。
 {
   const { SafeFileStorage } = await import("./storage.js");

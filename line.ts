@@ -422,6 +422,12 @@ export class Line {
     return out;
   }
 
+  /** 伺服器給過的某則訊息的時間（Msg.time）。沒看過就是 undefined。 */
+  timeOf(id: string): number | undefined {
+    const raw = this.#raw.get(id);
+    return raw ? Number(raw.createdTime ?? 0) : undefined;
+  }
+
   /**
    * 某聊天室的訊息，舊到新。
    * beforeId 給定時，取「那則之前」的 —— 往前翻頁用。
@@ -430,13 +436,14 @@ export class Line {
     let anchor: any;
     if (beforeId) {
       const raw = this.#raw.get(beforeId);
+      // 認不得的錨點（例如 archive 補的訊息）不能退回聊天室的最新錨點：那會把最新一頁
+      // 當成「更舊的」再給一次。交給呼叫端從 archive 往前找。
+      if (!raw) return [];
       // 錨點要的是 {deliveredTime, messageId}，deliveredTime 只有 raw 有。
-      if (raw) {
-        anchor = {
-          deliveredTime: Number(raw.deliveredTime ?? raw.createdTime ?? 0),
-          messageId: BigInt(String(raw.id)),
-        };
-      }
+      anchor = {
+        deliveredTime: Number(raw.deliveredTime ?? raw.createdTime ?? 0),
+        messageId: BigInt(String(raw.id)),
+      };
     }
     if (!anchor) {
       if (!this.#anchors.has(chatMid)) await this.chats(Number.MAX_SAFE_INTEGER);

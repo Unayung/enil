@@ -154,7 +154,11 @@ npx tsx cli.ts read <mid> 5 | jq -r '.[]|"\(.fromName)：\(.text)"'
   （`state.json` / `sock` / `media/` / `storage.json` / `archive.jsonl`）。
   `archive.jsonl` 是 `onIncoming` 落地的訊息存檔，一則一行、只增不刪、0600 ——
   伺服器只留兩週，這是唯一的長期歷史。重連可能重複寫同一則，讀的時候用 `id` 去重。
-  它從加上這功能的那天開始累積，補不回過去。憑證本來在 CWD 的
+  它從加上這功能的那天開始累積，補不回過去。
+  `history` 在伺服器給不滿時從這裡補更舊的（`archive.ts`，標 `archived: true`）。
+  所以 `line.history` 遇到認不得的 `before`（archive 來的）要回空陣列，不能退回最新錨點 ——
+  那會把最新一頁當成「更舊的」再給一次。
+  憑證本來在 CWD 的
   `./storage.json`，換個目錄啟動就會重掃 QR 並 rotate 掉舊憑證，所以搬進來了；
   `paths.ts` 的 `prepareStorage()` 負責搬家。
 - 建立在 enil 之上的應用（監看聊天室、自動通報之類）放在別的 repo，不在這裡。

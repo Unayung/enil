@@ -21,6 +21,7 @@ import { basename, join, sep } from "node:path";
 import { callerOf, type Chat, type ChatEvent, Line, type Msg } from "./line.js";
 import { NeedsQrLogin } from "./login.js";
 import { APNS_FILE, ARCHIVE_FILE, MEDIA_DIR, PUSH_DEVICES_FILE, REMOTE_TOKEN_FILE, SOCK, STATE_DIR, STATE_FILE } from "./paths.js";
+import { archiveLines, olderFrom, timeIn } from "./archive.js";
 import { activityPayload, apnsPush, voipPush, type ApnsConfig, type PushDevice } from "./apns.js";
 import { isVip, MAC_REPLY_BUTTON, macAlertArgs, setVip, vipAlertArgs, vipList } from "./vip.js";
 
@@ -165,8 +166,9 @@ const handlers: Record<string, (line: Line, req: any) => Promise<unknown>> = {
   },
   async history(line, req) {
     if (!req.chat) throw new Error("缺 chat");
-    const msgs = await line.history(req.chat, req.count ?? 20, req.before);
-    // 往前翻頁不該動已讀狀態。
+    const count = req.count ?? 20;
+    const msgs = await line.history(req.chat, count, req.before);
+    // 往前翻頁不該動已讀狀態。標已讀只看伺服器給的，下面 archive 補的不算。
     if (req.markRead && !req.before) {
       // 打開某聊天室就等於看過了。讀不到歷史的聊天室也要能清未讀，
       // 所以 lastMessageId 交給 line.markRead 用錨點決定。
@@ -174,7 +176,14 @@ const handlers: Record<string, (line: Line, req: any) => Promise<unknown>> = {
       const chat = state.chats.find((c) => c.mid === req.chat);
       if (chat) { chat.unread = 0; writeState(); }
     }
-    return msgs;
+    // 伺服器給不滿（只留約兩週、或翻到底了）：從自己存的 archive 補更舊的。
+    if (msgs.length >= count) return msgs;
+    const lines = archiveLines();
+    const edge = msgs.length ? msgs[0].time
+      : req.before ? line.timeOf(String(req.before)) ?? timeIn(lines, String(req.before))
+      : Number.MAX_SAFE_INTEGER;
+    if (edge === undefined) return msgs; // 錨點哪裡都找不到，不知道從哪裡往前
+    return [...olderFrom(lines, req.chat, edge, count - msgs.length, new Set(msgs.map((m) => m.id))), ...msgs];
   },
   async download(line, req) {
     // 用 messageId 而不是 id：請求信封本身有一個對帳用的 id，

@@ -168,12 +168,14 @@ npx tsx cli.ts chats 200 | jq -r 'sort_by(-.lastTime)[0:10][]|"\(.name)：\(.las
 | `readCount` | 自己發的有幾個人讀了（一對一時 1 就是已讀） |
 | `reactions` | 表情回應 `[{from, type}]`，`type` 是 `NICE` `LOVE` `FUN` `AMAZING` `SAD` `OMG`，認不得的是 `OTHER` |
 | `mentions` | 這則 @ 了誰（mid）；`"all"` 是 @所有人 |
+| `archived` | 從本機存檔補的（伺服器已經不留了）。是收到當下的快照：沒有後來的已讀數、表情、收回，也不能 `download` |
 
 ## 長期歷史
 
-LINE 對次要裝置只保留約兩週，`read` 對更久以前的聊天室會回**空陣列**（不是錯誤）。
-daemon 收到的每則訊息都會落地成 `~/.local/state/enil/archive.jsonl`，一則一行，
-欄位跟 `read` 回傳的一樣：
+LINE 對次要裝置只保留約兩週。daemon 收到的每則訊息都會落地成
+`~/.local/state/enil/archive.jsonl`，一則一行，欄位跟 `read` 回傳的一樣。
+伺服器給不滿 `count` 時，`read`（與往前翻頁）會自動從這份補更舊的，補上的帶
+`archived: true`。直接查也可以：
 
 ```bash
 jq -r 'select(.chat=="<mid>")|"\(.fromName)：\(.text)"' ~/.local/state/enil/archive.jsonl
