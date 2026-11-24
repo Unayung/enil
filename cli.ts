@@ -50,6 +50,7 @@ const USAGE = "用法：\n" +
   "  broadcast <名單檔> <text...> [--tag 名稱] [--delay 秒] [--dry-run] [--yes]\n" +
   "  squares              （加入的 OpenChat，不在 chats 裡）\n" +
   "  login                （沒有快取憑證時，觸發 QR 登入）\n" +
+  "  settings             （帳號設定，唯讀；notificationDisabledWithSub 看手機通知）\n" +
   "  state";
 
 // ENIL_READONLY=1：交給 agent 用時的護欄。擋掉所有別人看得到的動作 —— 送出、群發、
@@ -126,6 +127,8 @@ const req = (cmd === "broadcast" || readonlyBlocked ? undefined : (() => {
       return { cmd: "squareHistory", chat: args[0], count: args[1] ? Number(args[1]) : undefined };
     case "state":
       return { cmd: "state" };
+    case "settings":
+      return { cmd: "settings" };
     default:
       return undefined;
   }

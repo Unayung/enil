@@ -593,6 +593,15 @@ export class Line {
     return { path: await this.#cachePublic(`sticker-${id}.thumb`, stickerUrl(id)), animated: false };
   }
 
+  /**
+   * 帳號設定（唯讀）。看 notificationDisabledWithSub：為 true 時，次要裝置在線上手機就不通知。
+   * 回傳裡有 bigint（例如 notificationMuteExpiration），轉成字串才能走 JSON。
+   */
+  async settings(): Promise<Record<string, unknown>> {
+    const s: any = await this.#base.talk.getSettings({ syncReason: "INTERNAL" } as any);
+    return JSON.parse(JSON.stringify(s ?? {}, (_k, v) => (typeof v === "bigint" ? v.toString() : v)));
+  }
+
   /** 收回自己的訊息。 */
   async unsend(messageId: string): Promise<void> {
     await this.#base.talk.unsendMessage({ seq: await this.#base.getReqseq("talk"), messageId });
