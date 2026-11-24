@@ -159,6 +159,10 @@ const handlers: Record<string, (line: Line, req: any) => Promise<unknown>> = {
   async settings(line) {
     return await line.settings();
   },
+  async setNotifyWithSub(line, req) {
+    if (typeof req.value !== "boolean") throw new Error("value 要是 true 或 false");
+    return { notificationDisabledWithSub: await line.setNotifyDisabledWithSub(req.value) };
+  },
   async squareHistory(line, req) {
     if (!req.chat) throw new Error("缺 chat（squareChatMid，m 開頭）");
     return await line.squareHistory(String(req.chat), req.count ?? 20);
