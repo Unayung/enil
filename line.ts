@@ -593,6 +593,28 @@ export class Line {
     return { path: await this.#cachePublic(`sticker-${id}.thumb`, stickerUrl(id)), animated: false };
   }
 
+  /**
+   * 帳號設定（唯讀）。看 notificationDisabledWithSub：為 true 時，次要裝置在線上手機就不通知。
+   * 回傳裡有 bigint（例如 notificationMuteExpiration），轉成字串才能走 JSON。
+   */
+  async settings(): Promise<Record<string, unknown>> {
+    const s: any = await this.#base.talk.getSettings({ syncReason: "INTERNAL" } as any);
+    return JSON.parse(JSON.stringify(s ?? {}, (_k, v) => (typeof v === "bigint" ? v.toString() : v)));
+  }
+
+  /**
+   * 改 notificationDisabledWithSub：true＝次要裝置在線時手機不通知。會改帳號設定（伺服器端）。
+   * 寫完重讀一次回傳實際的值 —— 伺服器可能回 OK 卻沒套用，只看回應會誤判。
+   */
+  async setNotifyDisabledWithSub(value: boolean): Promise<boolean> {
+    await this.#base.talk.updateSettingsAttributes2({
+      reqSeq: await this.#base.getReqseq("talk"),
+      settings: { notificationDisabledWithSub: value },
+      attributesToUpdate: ["NOTIFICATION_DISABLED_WITH_SUB"],
+    } as any);
+    return Boolean((await this.settings()).notificationDisabledWithSub);
+  }
+
   /** 收回自己的訊息。 */
   async unsend(messageId: string): Promise<void> {
     await this.#base.talk.unsendMessage({ seq: await this.#base.getReqseq("talk"), messageId });

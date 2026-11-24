@@ -50,13 +50,15 @@ const USAGE = "用法：\n" +
   "  broadcast <名單檔> <text...> [--tag 名稱] [--delay 秒] [--dry-run] [--yes]\n" +
   "  squares              （加入的 OpenChat，不在 chats 裡）\n" +
   "  login                （沒有快取憑證時，觸發 QR 登入）\n" +
+  "  settings             （帳號設定，唯讀；notificationDisabledWithSub 看手機通知）\n" +
+  "  set-notify-with-sub <true|false>（設 notificationDisabledWithSub；false＝手機照樣通知）\n" +
   "  state";
 
 // ENIL_READONLY=1：交給 agent 用時的護欄。擋掉所有別人看得到的動作 —— 送出、群發、
-// 標已讀（對方會看到「已讀」）、QR 登入（會把另一台機器踢掉）。broadcast --dry-run 只預覽，放行。
+// 標已讀（對方會看到「已讀」）、QR 登入（會把另一台機器踢掉）、改帳號設定。broadcast --dry-run 只預覽，放行。
 // ponytail: 只擋 CLI。daemon 還要服務 TUI，直接連 socket 就繞得過；要真的鎖得改成 daemon 端的權限。
 const readonlyBlocked = process.env.ENIL_READONLY === "1" && (
-  ["send", "sendfile", "login"].includes(cmd) ||
+  ["send", "sendfile", "login", "set-notify-with-sub"].includes(cmd) ||
   (cmd === "broadcast" && !rest.includes("--dry-run")) ||
   (cmd === "read" && flags.has("--read"))
 );
@@ -126,6 +128,12 @@ const req = (cmd === "broadcast" || readonlyBlocked ? undefined : (() => {
       return { cmd: "squareHistory", chat: args[0], count: args[1] ? Number(args[1]) : undefined };
     case "state":
       return { cmd: "state" };
+    case "settings":
+      return { cmd: "settings" };
+    case "set-notify-with-sub":
+      // 參數是 notificationDisabledWithSub 的值：false＝enil 在線時手機照樣通知。
+      if (args[0] !== "true" && args[0] !== "false") return undefined;
+      return { cmd: "setNotifyWithSub", value: args[0] === "true" };
     default:
       return undefined;
   }

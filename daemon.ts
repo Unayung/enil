@@ -156,6 +156,13 @@ const handlers: Record<string, (line: Line, req: any) => Promise<unknown>> = {
     // 跟面板搜尋同一套規則：比對名稱、不分大小寫。
     return enriched.filter((c) => String(c.name || c.mid).toLowerCase().includes(q));
   },
+  async settings(line) {
+    return await line.settings();
+  },
+  async setNotifyWithSub(line, req) {
+    if (typeof req.value !== "boolean") throw new Error("value 要是 true 或 false");
+    return { notificationDisabledWithSub: await line.setNotifyDisabledWithSub(req.value) };
+  },
   async squareHistory(line, req) {
     if (!req.chat) throw new Error("缺 chat（squareChatMid，m 開頭）");
     return await line.squareHistory(String(req.chat), req.count ?? 20);
